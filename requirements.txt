@@ -1,0 +1,20 @@
+# ── AlgoPilotX Options — Python Dependencies ────────────────────────────────
+# Pure backend, paper trading only. No web server, no WebSocket transport —
+# run_options.py is a single asyncio loop that logs to the console.
+
+# DhanHQ SDK — used only by scripts/generate_token.py (daily access-token
+# refresh). The engine itself talks to DhanHQ over plain REST (requests).
+dhanhq>=2.0.0
+
+# Data processing (candle building, Heikin-Ashi, RSI)
+pandas>=2.0.0
+numpy>=1.26.0
+
+# HTTP client with connection pooling (option chain, margin calculator)
+requests>=2.31.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# Timezone support (zoneinfo is stdlib in Python 3.9+, backport for < 3.9)
+tzdata>=2024.1
