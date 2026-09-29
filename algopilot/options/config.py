@@ -1,11 +1,10 @@
 """
-algopilot/options/config.py — configuration for the NIFTY options
-paper-trading engine.
+algopilot/options/config.py — configuration for the NIFTY options engine.
 
-Pure paper trading only — DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN are used purely
-to read live market data (option chain, expiry list, margin calculator,
-scrip master, and the real-time WebSocket feed). No order is ever placed;
-OPTIONS_PAPER_TRADING=false is refused at startup.
+OPTIONS_PAPER_TRADING=true  -> paper: live market data, simulated fills, no order placed.
+OPTIONS_PAPER_TRADING=false -> LIVE: real orders on DhanHQ (see broker.py), real money.
+Live mode always runs with a daily loss limit (OPTIONS_MAX_DAILY_LOSS, default
+Rs 3,000) after which no new trade is opened.
 
 Entries are pure Heikin-Ashi pattern (GREEN->RED->RED) — there is no RSI
 gate, no volume gate, and no profit ratchet. The only two things that ever
@@ -32,6 +31,18 @@ class OptionsConfigError(RuntimeError):
     """Raised when OPTIONS_* configuration is invalid or missing."""
 
 
+def token_client_id(raw_token: str) -> Optional[str]:
+    """The Dhan client id a JWT access token was issued for (its
+    `dhanClientId` claim), or None if it isn't a JWT we recognise. A token
+    only works together with that exact client id — see load_options_config."""
+    try:
+        payload = raw_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(payload))["dhanClientId"])
+    except Exception:
+        return None
+
+
 def token_expiry_ist(raw_token: str) -> Optional[datetime]:
     """The DhanHQ access token's JWT expiry, in IST — or None if it isn't a
     JWT we recognise. Used to warn BEFORE a silent disconnect happens: when
@@ -50,6 +61,18 @@ def token_expiry_ist(raw_token: str) -> Optional[datetime]:
 
 _CANDLE_TIMEFRAMES = {"1m": 60, "5m": 300}
 
+# Live-mode daily loss limit when OPTIONS_MAX_DAILY_LOSS isn't set (Rs).
+_LIVE_DEFAULT_DAILY_LOSS = 3000.0
+
+
+def _hhmm(raw: str) -> str:
+    """Validate an HH:MM time and return it zero-padded ("9:30" -> "09:30"),
+    so string comparison against other HH:MM values is correct."""
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M").strftime("%H:%M")
+    except ValueError:
+        raise OptionsConfigError(f"Invalid time '{raw}' — expected HH:MM, e.g. 09:30.")
+
 
 @dataclass(frozen=True)
 class OptionsConfig:
@@ -58,6 +81,25 @@ class OptionsConfig:
 
     enabled: bool = True
     paper_trading: bool = True
+
+    # ── LIVE ORDERS (ignored in paper mode) ─────────────────────────────────
+    # Hard cap on lots per live trade, whatever the capital would allow.
+    live_max_lots: int = 1
+    # Stop opening new trades once the day's NET loss reaches this (Rs).
+    # 0 = off (paper only); live mode refuses to start without it.
+    max_daily_loss: float = 0.0
+    # Entry/exit orders: MARKET, or LIMIT at the last price +/- a buffer
+    # (a marketable limit — fills now, but never worse than the buffer).
+    live_order_type: str = "MARKET"
+    live_limit_buffer_pct: float = 3.0
+    # The protective stop resting at the exchange is a STOP-LIMIT (NSE does
+    # not allow stop-market on options): trigger = the engine's stop level,
+    # limit = trigger + this %, so it still fills on a fast move.
+    stop_limit_buffer_pct: float = 10.0
+    # If price is past the stop and that exchange order still hasn't filled
+    # after this long (it gapped beyond its limit), the engine cancels it and
+    # buys back at market itself.
+    stop_escalate_secs: float = 3.0
     paper_capital: float = 250000.0
     candle_timeframe_secs: int = 300
     max_concurrent: int = 1
@@ -88,6 +130,34 @@ class OptionsConfig:
     # the WebSocket feed, not this loop — see engine.py's on_market_tick().
     poll_interval_secs: float = 1.0
 
+    # Candles close at EXACTLY the timeframe boundary (hh:mm:00.000). A
+    # positive value waits that many ms after the boundary so a trade printed
+    # in the final milliseconds, still in flight on the network, is included
+    # — at the cost of deciding that much later. 0 = decide at the boundary.
+    candle_close_grace_ms: int = 0
+
+    # No new entries before this IST time (HH:MM). market_hours.py always
+    # documented a post-open buffer; the engine never enforced it. Set to
+    # 09:15 to allow entries from the open.
+    entry_start: str = "09:30"
+    # On expiry day, trade next week's contract instead of the one settling
+    # at 15:30 today (0 DTE). Off by default = trade the nearest expiry.
+    roll_on_expiry_day: bool = False
+
+    # Cost model applied to every paper fill — see charges.py. Defaults are
+    # ESTIMATES of published Indian F&O rates and change with budgets and
+    # exchange circulars; verify against a real Dhan contract note. Without
+    # these the engine reports frictionless P&L, which at 1 lot is wrong by
+    # roughly Rs 50 a round trip — enough to turn small paper wins into real
+    # losses. Set OPTIONS_APPLY_CHARGES=false to see gross numbers instead.
+    apply_charges: bool = True
+    brokerage_per_order: float = 20.0
+    stt_pct: float = 0.10
+    exchange_txn_pct: float = 0.0495
+    sebi_pct: float = 0.0001
+    stamp_duty_pct: float = 0.003
+    gst_pct: float = 18.0
+
     # Minimum gap between actual calls to DhanHQ's option-chain endpoints
     # (chain + expiry list share this — used only for spot/band resolution,
     # not premiums, which come from the WebSocket feed). DhanHQ documents
@@ -108,15 +178,29 @@ def load_options_config() -> OptionsConfig:
         raise OptionsConfigError("Missing DHAN_CLIENT_ID environment variable.")
     if not raw_token:
         raise OptionsConfigError("Missing DHAN_ACCESS_TOKEN environment variable.")
+    token_owner = token_client_id(raw_token)
+    if token_owner is not None and token_owner != client_id:
+        # Every DhanHQ call sends both; a token issued for another account is
+        # rejected with a bare HTTP 401 that reads exactly like an expired
+        # token. Catch it here, by name, before any network call.
+        raise OptionsConfigError(
+            f"DHAN_ACCESS_TOKEN was issued for Dhan client id {token_owner}, but "
+            f"DHAN_CLIENT_ID is {client_id}. They must be the same account — set "
+            f"DHAN_CLIENT_ID={token_owner}, or use a token generated for {client_id}."
+        )
     access_token = SecretStr(raw_token)
     del raw_token
 
     paper_trading = os.getenv("OPTIONS_PAPER_TRADING", "true").strip().lower() == "true"
-    if not paper_trading:
+    live_order_type = os.getenv("OPTIONS_LIVE_ORDER_TYPE", "MARKET").strip().upper()
+    if live_order_type not in ("MARKET", "LIMIT"):
+        raise OptionsConfigError("OPTIONS_LIVE_ORDER_TYPE must be MARKET or LIMIT.")
+    raw_loss = os.getenv("OPTIONS_MAX_DAILY_LOSS", "").strip()
+    max_daily_loss = float(raw_loss) if raw_loss else (0.0 if paper_trading else _LIVE_DEFAULT_DAILY_LOSS)
+    if not paper_trading and max_daily_loss <= 0:
         raise OptionsConfigError(
-            "OPTIONS_PAPER_TRADING must stay 'true' — no live order path is wired "
-            "for options in this engine. Refusing to start rather than silently "
-            "run as if orders were being placed when none would be."
+            "OPTIONS_MAX_DAILY_LOSS must be above 0 in live mode (Rs; no new trades after the day's "
+            "net loss reaches it). Remove the line to use the default Rs 3,000."
         )
 
     raw_tf = os.getenv("OPTIONS_CANDLE_TIMEFRAME", "5m").strip().lower()
@@ -151,6 +235,12 @@ def load_options_config() -> OptionsConfig:
         access_token=access_token,
         enabled=os.getenv("OPTIONS_ENABLED", "true").strip().lower() == "true",
         paper_trading=paper_trading,
+        live_max_lots=max(1, int(os.getenv("OPTIONS_LIVE_MAX_LOTS", "1"))),
+        max_daily_loss=max_daily_loss,
+        live_order_type=live_order_type,
+        live_limit_buffer_pct=float(os.getenv("OPTIONS_LIVE_LIMIT_BUFFER_PCT", "3.0")),
+        stop_limit_buffer_pct=float(os.getenv("OPTIONS_STOP_LIMIT_BUFFER_PCT", "10.0")),
+        stop_escalate_secs=float(os.getenv("OPTIONS_STOP_ESCALATE_SECS", "3.0")),
         paper_capital=paper_capital,
         candle_timeframe_secs=_CANDLE_TIMEFRAMES[raw_tf],
         max_concurrent=max_concurrent,
@@ -161,6 +251,16 @@ def load_options_config() -> OptionsConfig:
         nifty_index_segment=os.getenv("OPTIONS_NIFTY_SEGMENT", "IDX_I").strip(),
         option_exchange_segment=os.getenv("OPTIONS_EXCHANGE_SEGMENT", "NSE_FNO").strip(),
         fallback_margin_per_lot=float(os.getenv("OPTIONS_FALLBACK_MARGIN_PER_LOT", "130000.0")),
+        candle_close_grace_ms=max(0, int(os.getenv("OPTIONS_CANDLE_CLOSE_GRACE_MS", "0"))),
+        entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:30")),
+        roll_on_expiry_day=os.getenv("OPTIONS_ROLL_ON_EXPIRY_DAY", "false").strip().lower() == "true",
+        apply_charges=os.getenv("OPTIONS_APPLY_CHARGES", "true").strip().lower() == "true",
+        brokerage_per_order=float(os.getenv("OPTIONS_BROKERAGE_PER_ORDER", "20.0")),
+        stt_pct=float(os.getenv("OPTIONS_STT_PCT", "0.10")),
+        exchange_txn_pct=float(os.getenv("OPTIONS_EXCHANGE_TXN_PCT", "0.0495")),
+        sebi_pct=float(os.getenv("OPTIONS_SEBI_PCT", "0.0001")),
+        stamp_duty_pct=float(os.getenv("OPTIONS_STAMP_DUTY_PCT", "0.003")),
+        gst_pct=float(os.getenv("OPTIONS_GST_PCT", "18.0")),
         poll_interval_secs=float(os.getenv("OPTIONS_POLL_INTERVAL_SECS", "1.0")),
         chain_min_interval_secs=chain_min_interval,
     )

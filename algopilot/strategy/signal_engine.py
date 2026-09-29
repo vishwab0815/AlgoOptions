@@ -113,7 +113,7 @@ class SignalEngine:
                           is the only one allowed to trigger.
 
         Exit is NOT decided here. Once in a position, TradingEngine tracks a
-        trailing exit level (the Heikin-Ashi high/low of the candle 1 bar
+        trailing exit level (the Heikin-Ashi high/low of the candle 2 bars
         behind the current one, per `rules`) and checks it against live price on
         every tick — see PositionTracker.check_cover_level(). This method
         only ever proposes the entry signal; it never proposes the exit.

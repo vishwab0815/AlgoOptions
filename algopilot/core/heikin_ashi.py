@@ -22,7 +22,6 @@ class HeikinAshiRow:
 _COLUMNS = [
     "open", "high", "low", "close", "volume",
     "ha_open", "ha_high", "ha_low", "ha_close",
-    "ema", "atr", "rsi",
 ]
 
 
@@ -31,17 +30,11 @@ class HeikinAshiEngine:
     Maintains a rolling pandas DataFrame of Heikin-Ashi transformed candles.
 
     Standard OHLCV candles are appended via :meth:`append_candle`.
-    Indicator values (EMA, ATR, RSI) are injected into the last row via
-    :meth:`update_last_indicators` after each candle close.
 
-    Performance notes (vs the original):
-      - append_candle() uses pd.concat() instead of df.loc[len(df)] = row.
-        The old form triggered a full DataFrame copy on EVERY candle append
-        (O(n) per call). pd.concat() is O(1) amortised.
-      - The rolling trim is now deferred: the buffer is allowed to grow to
-        2× max_rows before it is sliced back to max_rows, so the O(n)
-        reset_index() runs at most once every max_rows candles rather than
-        once per candle once the buffer is full.
+    Cost: each append copies the frame (pd.concat), ~0.25 ms at a few
+    hundred rows — measured, and negligible next to a 5-minute candle. The
+    buffer grows to 2x max_rows before being trimmed back, so the trim runs
+    once every max_rows candles, not on every one.
     """
 
     # Grow to this multiple of max_rows before trimming (amortises the slice).
@@ -79,7 +72,6 @@ class HeikinAshiEngine:
             "open": o, "high": h, "low": l, "close": c, "volume": v,
             "ha_open": ha_open, "ha_high": ha_high,
             "ha_low": ha_low, "ha_close": ha_close,
-            "ema": float("nan"), "atr": float("nan"), "rsi": float("nan"),
         }
 
         new_df = pd.DataFrame([row], columns=pd.Index(_COLUMNS))
@@ -93,14 +85,4 @@ class HeikinAshiEngine:
         if len(self.df) >= self._trim_at:
             self.df = self.df.iloc[-self.max_rows:].reset_index(drop=True)
 
-        return self.df.iloc[-1]
-
-    def update_last_indicators(self, ema: float, atr: float, rsi: float) -> pd.Series:
-        """Inject computed indicator values into the most-recently appended row."""
-        if self.df.empty:
-            raise RuntimeError("Cannot update indicator values on an empty DataFrame")
-
-        self.df.at[self.df.index[-1], "ema"] = ema
-        self.df.at[self.df.index[-1], "atr"] = atr
-        self.df.at[self.df.index[-1], "rsi"] = rsi
         return self.df.iloc[-1]

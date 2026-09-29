@@ -184,9 +184,14 @@ class CandleBuilder:
         # already-closed, already-evaluated candle, so this still can't be
         # applied — but it's now counted and logged instead of vanishing.
         self.dropped_out_of_order_ticks += 1
-        logger.warning(
-            "%s: dropped out-of-order tick (bucket %s is before the in-progress "
-            "candle %s — likely a feed reconnect overlap). Total dropped so far: %d.",
+        # DEBUG, not WARNING: with candles closed at the exact boundary, a
+        # trade printed in the last few ms that is still on the wire when the
+        # boundary passes is EXPECTED to miss its candle. It's counted, and
+        # the total is reported in the session summary.
+        logger.debug(
+            "%s: dropped a late tick for bucket %s — that candle had already closed "
+            "(in-progress candle is %s). Usually a trade printed just before a boundary "
+            "that arrived after the close grace, or a reconnect overlap. Total dropped: %d.",
             self.symbol, bucket_start.isoformat(), self._current_start.isoformat(),
             self.dropped_out_of_order_ticks,
         )

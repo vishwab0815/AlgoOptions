@@ -87,6 +87,9 @@ _MARGIN_TTL_SECS = 900.0    # SPAN/exposure margin is stable within a session
 _SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 _SCRIP_MASTER_CACHE_TTL = 24 * 3600.0
 
+# A rejected token is logged at most this often, not on every poll.
+_AUTH_FAIL_LOG_EVERY_SECS = 60.0
+
 _EXCLUDED_UNDERLYINGS = ("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT")
 
 
@@ -145,12 +148,38 @@ class OptionsDhanClient:
         self._scrip_cache_path = Path(scrip_cache_path)
         # (expiry YYYY-MM-DD, strike, "CE"|"PE") -> ContractInfo
         self._scrip_index: Optional[Dict[Tuple[str, float, str], ContractInfo]] = None
+        # Set on the first HTTP 401/403 from any endpoint — the engine stops on
+        # it rather than running blind (see OptionsEngine.maintenance_tick).
+        self.auth_failed = False
+        self._last_auth_log = -1e9
 
     def close(self) -> None:
         try:
             self._session.close()
         except Exception:
             pass
+
+    def _auth_rejected(self, resp: requests.Response, what: str) -> bool:
+        """BUG FIXED: a dead token used to surface only as a generic
+        "expiry list lookup failed: 401 Client Error" repeated every few
+        seconds while the engine sat there doing nothing — no expiry, so no
+        chain, so no band, so no trades, and nothing said why. A 401/403 is
+        now named for what it is, logged at most once a minute."""
+        if resp.status_code not in (401, 403):
+            return False
+        self.auth_failed = True
+        now = time.monotonic()
+        if now - self._last_auth_log >= _AUTH_FAIL_LOG_EVERY_SECS:
+            self._last_auth_log = now
+            logger.error(
+                "DhanHQ REJECTED THE ACCESS TOKEN (HTTP %d on %s). It has expired (tokens last 24h), "
+                "been revoked, or belongs to a different client id than DHAN_CLIENT_ID%s. Nothing can "
+                "be fetched until it is fixed: generate a new token (scripts/generate_token.py), set "
+                "DHAN_ACCESS_TOKEN (and a matching DHAN_CLIENT_ID) in .env, and restart.",
+                resp.status_code, what,
+                "" if resp.status_code == 401 else ", or this account lacks DhanHQ Data API access",
+            )
+        return True
 
     # ── Option-chain pacing (non-blocking cooldown, not a blocking wait) ──────
 
@@ -177,6 +206,8 @@ class OptionsDhanClient:
                 timeout=10.0,
             )
             self._note_chain_call(was_429=resp.status_code == 429)
+            if self._auth_rejected(resp, "expiry list"):
+                return []
             resp.raise_for_status()
             expiries = resp.json().get("data", [])
             return sorted(expiries)
@@ -212,6 +243,8 @@ class OptionsDhanClient:
                     "Options: option-chain HTTP 429 (rate limited) — backing off %.0fs.",
                     _CHAIN_429_BACKOFF_SECS,
                 )
+                return None
+            if self._auth_rejected(resp, "option chain"):
                 return None
             resp.raise_for_status()
             payload = resp.json().get("data", {})
@@ -275,6 +308,8 @@ class OptionsDhanClient:
                 },
                 timeout=15.0,
             )
+            if self._auth_rejected(resp, "intraday candles"):
+                return None
             if resp.status_code != 200:
                 logger.warning(
                     "Options: intraday candle backfill HTTP %d for security %s — skipping backfill.",
@@ -348,6 +383,8 @@ class OptionsDhanClient:
                 },
                 timeout=5.0,
             )
+            if self._auth_rejected(resp, "margin calculator"):
+                return fallback, False
             if resp.status_code != 200:
                 logger.warning(
                     "Options: margin calculator HTTP %d — using fallback Rs %.0f/lot.",
@@ -371,12 +408,23 @@ class OptionsDhanClient:
         self, security_id: Optional[str], exchange_segment: str, price: float,
         lot_size: int, fallback: float,
     ) -> Tuple[float, bool]:
-        """Non-blocking wrapper — runs the blocking token-bucket wait + HTTP
-        call in a thread pool so the asyncio event loop stays live during the
-        acquire() sleep and the network round-trip."""
+        """Non-blocking wrapper. LATENCY: a cached figure is returned inline —
+        this sits on the entry path the instant a candle closes, and even a
+        thread-pool hop costs time there. Only a cache miss goes to a thread
+        (token-bucket wait + HTTP), and the engine pre-fetches in the
+        background so that miss never lands at the trigger."""
+        if security_id and price > 0:
+            cached = self._margin_cache.get(security_id)
+            if cached is not None and (time.monotonic() - cached[1]) < _MARGIN_TTL_SECS:
+                return cached[0], True
         return await asyncio.to_thread(
             self.margin_per_lot, security_id, exchange_segment, price, lot_size, fallback
         )
+
+    def margin_cache_age(self, security_id: Optional[str]) -> Optional[float]:
+        """Seconds since this contract's margin was fetched, or None if never."""
+        cached = self._margin_cache.get(security_id) if security_id else None
+        return None if cached is None else time.monotonic() - cached[1]
 
     # ── NIFTY option contract resolution (scrip master) ────────────────────────
 

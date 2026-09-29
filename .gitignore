@@ -42,3 +42,6 @@ htmlcov/
 
 # ── Scratch / one-off analysis output (never project source) ────────────────
 scratch_*
+
+# Build artifact — regenerated on demand, never committed
+AlgoOptions.zip

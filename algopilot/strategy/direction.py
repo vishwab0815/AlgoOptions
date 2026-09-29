@@ -60,7 +60,8 @@ class DirectionRules:
     def trailing_stop_reference(self, raw_high: float, raw_low: float) -> float:
         """The trailing exit level trails the Heikin-Ashi HIGH for a SHORT
         (price rising against you) and the Heikin-Ashi LOW for a LONG (price
-        falling against you), both from the candle 1 bar back."""
+        falling against you), both from the candle before the last closed one
+        (two candles behind the one currently forming — see options/position.py)."""
         return raw_high if self.is_short else raw_low
 
     def profit_pct(self, entry_price: float, current_price: float) -> float:

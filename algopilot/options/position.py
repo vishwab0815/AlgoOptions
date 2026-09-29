@@ -17,9 +17,16 @@ from typing import Any, Optional
 
 from ..strategy.direction import SHORT
 
-# How many candles back the trailing cover level looks for its reference
-# high. lookback=1: the level active while a candle is forming is always
-# the immediately preceding candle's HA high.
+# The engine calls trailing_exit_level() at the CLOSE of each candle, passing
+# that just-closed candle's index; the level returned is the HA high of the
+# candle BEFORE it. So while the next candle forms, the stop is the HA high
+# from TWO candles back — not the immediately preceding one.
+#
+# (CORRECTED: this comment, the banner and the code comments all used to say
+# "1 bar back", which is not what runs. The behaviour is kept deliberately:
+# on 8 real sessions with realistic fills it was the best of 13 exits tested,
+# and the literal 1-back stop lost ~Rs 6,200 more — it cuts short the few
+# long trends that carry the strategy.)
 COVER_LEVEL_LOOKBACK = 1
 
 
@@ -31,8 +38,13 @@ class OpenPosition:
     entry_price: float = 0.0
     qty: int = 0
     entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    entry_order_id: str = ""      # paper-fill identifier
+    entry_order_id: str = ""      # paper-fill id, or the real Dhan order id in live mode
     cover_level: float = 0.0      # 0.0 = no trailing cover level set yet
+    # ── live mode only ───────────────────────────────────────────────────────
+    stop_order_id: str = ""       # protective stop-limit resting at the exchange
+    stop_trigger_sent: float = 0.0  # trigger that order currently carries
+    closing: bool = False         # a buy-back is in flight — never start a second
+    breach_since: Optional[float] = None  # monotonic time price first crossed the stop
 
     @property
     def rules(self):

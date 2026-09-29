@@ -47,12 +47,62 @@ Safe to call multiple times — subsequent calls are no-ops.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _already_forced = False
+_tls_configured = False
+
+
+def ensure_tls_trust_store() -> None:
+    """Point this process's TLS verification at certifi's CA bundle.
+
+    Root cause this exists to fix: on a fresh Windows VM the market feed died
+    instantly with
+        [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate
+    and never reconnected — so the engine ran a full session on REST polling
+    alone, receiving zero ticks and opening zero trades, while looking
+    healthy in the log. A Python install that has no usable system trust
+    store cannot verify api.dhan.co, and `ssl.create_default_context()`
+    (which `websockets` and `requests` both use) silently has nothing to
+    verify against.
+
+    `ssl` reads SSL_CERT_FILE when building its default context, so setting
+    it to certifi's bundle fixes every TLS client in the process at once.
+    setdefault, so an operator who has deliberately pointed these at a
+    corporate CA bundle keeps their own setting.
+    """
+    global _tls_configured
+    if _tls_configured:
+        return
+    _tls_configured = True
+
+    if os.environ.get("SSL_CERT_FILE") and os.path.isfile(os.environ["SSL_CERT_FILE"]):
+        logger.debug("TLS trust store: using preset SSL_CERT_FILE=%s", os.environ["SSL_CERT_FILE"])
+        return
+
+    try:
+        import certifi
+    except ImportError:
+        logger.warning(
+            "certifi is not installed — TLS verification falls back to the system trust "
+            "store, which on some Windows/VM Python installs is empty and fails every "
+            "HTTPS and WebSocket connection with CERTIFICATE_VERIFY_FAILED. "
+            "Fix with: pip install certifi"
+        )
+        return
+
+    bundle = certifi.where()
+    if not os.path.isfile(bundle):
+        logger.warning("certifi reported a CA bundle at %s but it does not exist.", bundle)
+        return
+
+    os.environ.setdefault("SSL_CERT_FILE", bundle)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", bundle)
+    logger.info("TLS trust store: verifying against certifi's CA bundle.")
 
 
 def force_ipv4() -> None:

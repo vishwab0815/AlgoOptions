@@ -1,21 +1,19 @@
 """
-AlgoPilotX — NIFTY Options Premium-Selling PAPER TRADING engine.
+AlgoPilotX — NIFTY options premium-selling engine (paper or live).
 
 Sub-package layout
 ------------------
   algopilot/
-    core/          — CandleBuilder, HeikinAshiEngine, IndicatorState (RSI),
-                      RatchetConfig — pure, side-effect-free market math.
+    core/          — CandleBuilder, HeikinAshiEngine: pure market math.
     strategy/      — DirectionRules (SHORT), SignalEngine (the strict
                       GREEN->RED->RED breakout state machine).
-    utils/         — Market-hours guard, IPv4 fix, rate limiter, SecretStr.
-    options/       — The engine itself: config, DhanHQ REST access (quotes
-                      + margin, read-only), SQLite ledger, position/exit
-                      math, and the OptionsEngine composition root.
+    utils/         — Market-hours guard, IPv4 + TLS setup, rate limiter, SecretStr.
+    options/       — config, DhanHQ market data (dhan_client), real orders
+                      (broker — live mode only), charges, SQLite ledger,
+                      position/stop maths, and the OptionsEngine itself.
 
 Entry point: run_options.py, at the repo root.
 
-There is no live order path anywhere in this codebase — see
-algopilot/options/config.py, which refuses to start with
-OPTIONS_PAPER_TRADING=false.
+OPTIONS_PAPER_TRADING=true (default) -> paper: nothing is ever sent to the
+exchange. OPTIONS_PAPER_TRADING=false -> live: real orders on DhanHQ.
 """

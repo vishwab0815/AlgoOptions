@@ -18,3 +18,4 @@ python-dotenv>=1.0.0
 
 # Timezone support (zoneinfo is stdlib in Python 3.9+, backport for < 3.9)
 tzdata>=2024.1
+certifi==2025.8.3

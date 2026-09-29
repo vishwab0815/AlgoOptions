@@ -49,7 +49,8 @@ def main() -> int:
     day = sys.argv[1] if len(sys.argv) > 1 else datetime.now(_IST).strftime("%Y-%m-%d")
 
     cfg = load_options_config()
-    ledger = OptionsLedger(cfg.db_path)
+    # Read-only: safe while the engine is running — can't lock or change the live file.
+    ledger = OptionsLedger(cfg.db_path, readonly=True)
     candles = ledger.get_candle_log(day)
     trades = [t for t in ledger.get_all_trades(limit=2000) if t["trading_day"] == day]
     ledger.close()
@@ -98,17 +99,33 @@ def main() -> int:
     # ── Trades for the day ───────────────────────────────────────────────
     if trades:
         trades.sort(key=lambda t: t["entry_time"])
+        def _gross(t):
+            g = t.get("gross_pnl")
+            return g if g is not None else t["pnl"]
+
         wins = sum(1 for t in trades if t["pnl"] > 0)
         losses = sum(1 for t in trades if t["pnl"] < 0)
+        total_gross = sum(_gross(t) for t in trades)
+        total_chg = sum(t.get("charges") or 0.0 for t in trades)
         total_pnl = sum(t["pnl"] for t in trades)
-        print(f"\n{'-' * 100}\nTRADES — {len(trades)} total, {wins} win / {losses} loss, net Rs {total_pnl:+.2f}\n{'-' * 100}")
-        tcols = ["leg", "entry", "exit", "entry_rs", "exit_rs", "qty", "pnl_rs", "reason"]
-        twidths = {"leg": 3, "entry": 6, "exit": 6, "entry_rs": 9, "exit_rs": 9, "qty": 5, "pnl_rs": 10, "reason": 14}
+        gross_wins = sum(1 for t in trades if _gross(t) > 0)
+
+        print(f"\n{'-' * 100}")
+        print(f"TRADES — {len(trades)} total | NET {wins} win / {losses} loss | "
+              f"gross Rs {total_gross:+.2f} - charges Rs {total_chg:.2f} = NET Rs {total_pnl:+.2f}")
+        if gross_wins != wins:
+            print(f"  NOTE: {gross_wins - wins} trade(s) profitable on price alone "
+                  f"became losses once costs were applied.")
+        print('-' * 100)
+        tcols = ["leg", "entry", "exit", "entry_rs", "exit_rs", "qty", "gross_rs", "charges", "net_rs", "reason"]
+        twidths = {"leg": 3, "entry": 6, "exit": 6, "entry_rs": 9, "exit_rs": 9, "qty": 5,
+                   "gross_rs": 10, "charges": 8, "net_rs": 10, "reason": 14}
         trows = []
         for t in trades:
             trows.append([
                 t["leg"], _hhmm(t["entry_time"]), _hhmm(t["exit_time"]),
                 f"{t['entry_price']:.2f}", f"{t['exit_price']:.2f}", str(t["qty"]),
+                f"{_gross(t):+.2f}", f"{t.get('charges') or 0.0:.2f}",
                 f"{t['pnl']:+.2f}", t["exit_reason"],
             ])
         _print_table(trows, tcols, twidths)
@@ -133,10 +150,11 @@ def main() -> int:
     with trades_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["leg", "strike", "entry_time", "exit_time", "entry_price", "exit_price",
-                    "qty", "pnl", "exit_reason"])
+                    "qty", "gross_pnl", "charges", "net_pnl", "exit_reason"])
         for t in trades:
+            g = t.get("gross_pnl") if t.get("gross_pnl") is not None else t["pnl"]
             w.writerow([t["leg"], t["strike"], t["entry_time"], t["exit_time"], t["entry_price"],
-                        t["exit_price"], t["qty"], t["pnl"], t["exit_reason"]])
+                        t["exit_price"], t["qty"], g, t.get("charges") or 0.0, t["pnl"], t["exit_reason"]])
 
     print(f"\nCSV written: {candle_csv.resolve()}")
     print(f"CSV written: {trades_csv.resolve()}")
