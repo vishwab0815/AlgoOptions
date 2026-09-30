@@ -1,6 +1,6 @@
 """
-algopilot/options/dhan_client.py — read-only DhanHQ REST access for the
-NIFTY options paper-trading engine.
+algopilot/options/dhan_client.py — DhanHQ market-data REST access for the
+NIFTY options engine (orders live in broker.py).
 
 Four things, nothing else:
   1. Option-chain snapshot (POST /v2/optionchain) — spot AND every strike's
@@ -445,6 +445,11 @@ class OptionsDhanClient:
         """Non-blocking wrapper — the first call may trigger a CSV download
         (up to 60s); running it in a thread pool keeps the event loop live."""
         return await asyncio.to_thread(self.resolve_contract, expiry, strike, option_type)
+
+    async def warm_contracts_async(self) -> None:
+        """Load and index NSE's contract list now (a ~2.5 s download when the
+        cached copy is stale) instead of at the first strike lookup."""
+        await asyncio.to_thread(self._ensure_scrip_index)
 
     def _ensure_scrip_index(self) -> None:
         if self._scrip_index is not None and self._scrip_cache_path.exists():

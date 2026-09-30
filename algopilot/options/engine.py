@@ -126,6 +126,15 @@ _FUNDS_REFRESH_SECS = 60.0
 # Live mode: how often an open position is checked against Dhan's positions,
 # to notice a position closed OUTSIDE the engine (by hand in the Dhan app).
 _POSITION_CHECK_SECS = 5.0
+# Dhan's positions can lag an order fill by a few seconds (30-Sep: net 0 shown
+# 2 s after the 14:15 SELL filled). No conclusion is drawn from positions for
+# a contract the engine had a fill in within this window, and "flat" must be
+# seen on two reads this far apart before a trade is booked as closed outside.
+_POSITION_SETTLE_SECS = 10.0
+_FLAT_CONFIRM_SECS = 1.0
+# How long a stop-order cancel may take to be confirmed before a buy-back.
+_CANCEL_SETTLE_SECS = 3.0
+_ORDER_DONE = ("CANCELLED", "TRADED", "REJECTED", "EXPIRED")
 
 # Refresh a leg's cached margin this long before its 15-minute cache expires.
 _MARGIN_REFRESH_SECS = 600.0
@@ -184,10 +193,13 @@ class LegState:
     # began — used to tell a fresh setup from one formed during the previous
     # trade on this side (see _entry_skip_reason).
     starter_end: Optional[datetime] = None
+    # Start of the last candle evaluated on this leg: each candle is evaluated
+    # at most once, whichever path closes it (see _finalize_candle).
+    last_candle_start: Optional[datetime] = None
 
 
 class OptionsEngine:
-    """Composition root for the NIFTY options paper-trading engine."""
+    """Composition root for the NIFTY options engine (paper or live — see config.paper_trading)."""
 
     def __init__(self, config: OptionsConfig) -> None:
         self.config = config
@@ -242,6 +254,9 @@ class OptionsEngine:
         # Contracts where Dhan shows a position this engine didn't open — it
         # won't trade them (see _reconcile_live).
         self._blocked_contracts: set = set()
+        # Contract -> monotonic time of the engine's last fill in it (see
+        # _POSITION_SETTLE_SECS).
+        self._last_fill_at: Dict[str, float] = {}
         # BUG FIXED (paper too): "one trade at a time" was checked BEFORE the
         # await in _enter (margin lookup; in live, waiting for the fill). If CE
         # and PE both signalled on the same candle, the second passed the
@@ -288,13 +303,13 @@ class OptionsEngine:
         if self.broker is not None:
             logger.info(
                 "OptionsEngine starting | LIVE | max lots/trade=%d | sized on Dhan's available funds | "
-                "lot size=%d (config default) | trailing stop only, no RSI/ratchet",
+                "lot size=%d (config default) | exits: HA stop + profit lock + 15:00",
                 min(self.config.max_lots_per_trade, self.config.live_max_lots), self.config.lot_size,
             )
         else:
             logger.info(
                 "OptionsEngine starting | PAPER | capital=Rs %.0f | max lots/trade=%d | "
-                "lot size=%d (config default) | trailing stop only, no RSI/ratchet",
+                "lot size=%d (config default) | exits: HA stop + profit lock + 15:00",
                 self.balance, self.config.max_lots_per_trade, self.config.lot_size,
             )
         self.ledger.log_event("ENGINE_START", details=f"paper_capital={self.balance}")
@@ -303,6 +318,8 @@ class OptionsEngine:
         self._restore_realized_pnl()
         if self.broker is not None:
             await self._reconcile_live()
+
+        await self._prewarm()
 
         self.ws_manager = OptionsWebSocketManager(
             config=self.config,
@@ -359,6 +376,20 @@ class OptionsEngine:
             t.cancel()
         if pending:
             await asyncio.wait(pending, timeout=timeout)
+
+    async def _prewarm(self) -> None:
+        """Do the slow one-time setup NOW rather than at the first spot read.
+        On 30-Sep the engine took ~8 s from start to live ticks: the expiry
+        list, then a 5 s wait (the option-chain cooldown), then a 2.4 s
+        download of NSE's contract list. Started before the open, all of that
+        used to happen after 09:15; now only the spot read and the candle
+        history are left for then. Failure here is harmless — the same steps
+        run again in the maintenance loop."""
+        try:
+            await self._ensure_expiry_async()
+            await self.client.warm_contracts_async()
+        except Exception as exc:
+            logger.warning("Pre-open warm-up skipped (%s) — it will be done when the market opens.", exc)
 
     async def _candle_clock(self) -> None:
         """Close every leg's candle at EXACTLY the timeframe boundary.
@@ -647,6 +678,8 @@ class OptionsEngine:
                 candle_start=c_start, candle_end=c_end, strike=leg.strike, replay=True,
             )
 
+        if candles:
+            leg.last_candle_start = datetime.fromtimestamp(candles[-1]["timestamp"], tz=timezone.utc)
         level_note = f" (level Rs {leg.target_level:.2f})" if leg.target_level else ""
         logger.info(
             "[%s] backfill complete — %d real candle(s) replayed, pattern stage now %s%s",
@@ -824,7 +857,7 @@ class OptionsEngine:
                 "trade_id": p.trade_id, "entry_price": p.entry_price, "qty": p.qty,
                 "entry_time": p.entry_time.isoformat(), "entry_order_id": p.entry_order_id,
                 "cover_level": p.cover_level,
-                "best_price": p.best_price, "lock_price": p.lock_price,
+                "best_price": p.best_price, "lock_price": p.lock_price, "exit_pending": p.exit_pending,
                 "stop_order_id": p.stop_order_id, "stop_trigger_sent": p.stop_trigger_sent,
                 "strike": leg.strike, "security_id": leg.security_id, "lot_size": leg.lot_size,
             }
@@ -878,6 +911,7 @@ class OptionsEngine:
                 cover_level=pdata.get("cover_level", 0.0),
                 best_price=pdata.get("best_price", 0.0) or 0.0,
                 lock_price=pdata.get("lock_price", 0.0) or 0.0,
+                exit_pending=pdata.get("exit_pending", "") or "",
                 stop_order_id=pdata.get("stop_order_id", "") or "",
                 stop_trigger_sent=pdata.get("stop_trigger_sent", 0.0) or 0.0,
             )
@@ -1185,6 +1219,11 @@ class OptionsEngine:
            OPTIONS_OFFICIAL_CANDLE_WAIT_MS, the live-feed candle is used."""
         if leg is not self.legs.get(side):
             return None
+        if leg.last_candle_start is not None and candle.start_ts <= leg.last_candle_start:
+            logger.info("[%-2s] %s-%s already evaluated — duplicate close ignored.", side,
+                        f"{candle.start_ts.astimezone(_IST):%H:%M}", f"{candle.end_ts.astimezone(_IST):%H:%M}")
+            return None
+        leg.last_candle_start = candle.start_ts         # claimed before any await
         partial = leg.partial_bucket is not None and candle.start_ts == leg.partial_bucket
         if partial:
             leg.partial_bucket = None
@@ -1391,6 +1430,8 @@ class OptionsEngine:
         # is re-checked over REST in the background (_verify_entry_price).
         # BUY (exit): re-read the exact fill, since it's booked into the trade.
         res = await self.broker.wait_for_fill(order_id, exact=(txn == "BUY"))
+        if res.filled_qty > 0:
+            self._last_fill_at[leg.security_id] = time.monotonic()
         self.ledger.log_event("ORDER_RESULT", symbol=side,
                               details=f"{txn} order={order_id} status={res.status} filled={res.filled_qty} "
                                       f"avg={res.avg_price:.2f} {res.message}")
@@ -1408,14 +1449,51 @@ class OptionsEngine:
             pos.entry_price = st.avg_price
             self._save_state()
 
+    def _exchange_level(self, side: str, pos: OpenPosition) -> float:
+        """Where the BUY order parked at the exchange belongs: the closer of the
+        Heikin-Ashi stop and the profit lock. The lock only while the price is
+        below it — Dhan refuses a buy-stop trigger at or below the market; at or
+        above the lock the engine buys back itself (_check_exits_live)."""
+        levels = [pos.cover_level] if pos.cover_level > 0 else []
+        last = self._last_premium.get(side, 0.0)
+        if pos.lock_price > 0 and (last <= 0 or last < pos.lock_price - 1e-9):
+            levels.append(pos.lock_price)
+        return min(levels) if levels else 0.0
+
+    @staticmethod
+    def _stop_is_lock(pos: OpenPosition) -> bool:
+        """True when the parked exchange order currently sits at the profit lock."""
+        return (pos.lock_price > 0 and bool(pos.stop_order_id) and pos.stop_trigger_sent > 0
+                and abs(pos.stop_trigger_sent - to_tick(pos.lock_price, up=True)) < 1e-9)
+
+    def _stop_fill_reason(self, pos: OpenPosition) -> str:
+        """Exit reason for a fill of the parked order (ask BEFORE clearing stop_order_id)."""
+        return "PROFIT_LOCK" if self._stop_is_lock(pos) else "TRAILING_STOP"
+
+    def _maybe_park_lock(self, side: str, leg: LegState, premium: float) -> None:
+        """Park the profit lock at the exchange once the price is below it. It
+        can't be parked on the tick that first touches it (price == lock), and a
+        move can fail — so this is re-checked on ticks, at most every 2 s."""
+        pos = leg.position
+        if (pos is None or pos.lock_price <= 0 or not pos.stop_order_id or pos.stop_syncing
+                or pos.closing or pos.exit_pending or self._stop_is_lock(pos)
+                or not self._lock_is_tighter(pos) or premium >= pos.lock_price - 1e-9):
+            return
+        now = time.monotonic()
+        if now - pos.lock_park_tried_at < 2.0:
+            return
+        pos.lock_park_tried_at = now
+        self._spawn(self._sync_protective_stop(side, leg))
+
     async def _place_protective_stop(self, side: str, leg: LegState) -> None:
         pos = leg.position
         if pos is None or pos.closing:
             return
-        if pos.cover_level <= 0:
+        level = self._exchange_level(side, pos)
+        if level <= 0:
             logger.warning("[%-2s] no stop level yet — watched by the engine until the next candle close sets one.", side)
             return
-        trigger = to_tick(pos.cover_level, up=True)
+        trigger = to_tick(level, up=True)
         limit = to_tick(trigger * (1 + self.config.stop_limit_buffer_pct / 100.0), up=True)
         order_id, msg = await self.broker.place_async(
             "BUY", leg.security_id, pos.qty, "STOP_LOSS", price=limit, trigger=trigger, tag=new_tag())
@@ -1429,18 +1507,41 @@ class OptionsEngine:
             return
         pos.stop_order_id, pos.stop_trigger_sent = order_id, trigger
         self._save_state()
-        logger.info("[%-2s] protective stop at the exchange: BUY x%d trigger %.2f limit %.2f (order %s)",
-                    side, pos.qty, trigger, limit, order_id)
+        logger.info("[%-2s] protective stop at the exchange: BUY x%d trigger %.2f limit %.2f (order %s)%s",
+                    side, pos.qty, trigger, limit, order_id,
+                    " — profit lock" if self._stop_is_lock(pos) else "")
 
     async def _sync_protective_stop(self, side: str, leg: LegState) -> None:
-        """Move the exchange stop to the engine's new stop level."""
+        """Move the exchange order to where it belongs now (_exchange_level).
+        One move at a time per position: a request arriving while one is in
+        flight (a candle close and a new lock at once) is done right after it."""
         pos = leg.position
-        if pos is None or pos.closing:
+        if pos is None:
+            return
+        if pos.stop_syncing:
+            pos.stop_resync = True
+            return
+        pos.stop_syncing = True
+        try:
+            while True:
+                pos.stop_resync = False
+                await self._sync_protective_stop_once(side, leg)
+                if not pos.stop_resync or leg.position is not pos or pos.closing or pos.exit_pending:
+                    break
+        finally:
+            pos.stop_syncing = False
+
+    async def _sync_protective_stop_once(self, side: str, leg: LegState) -> None:
+        pos = leg.position
+        if pos is None or pos.closing or pos.exit_pending:
             return
         if not pos.stop_order_id:
             await self._place_protective_stop(side, leg)
             return
-        trigger = to_tick(pos.cover_level, up=True)
+        level = self._exchange_level(side, pos)
+        if level <= 0:
+            return
+        trigger = to_tick(level, up=True)
         if abs(trigger - pos.stop_trigger_sent) < 1e-9:
             return
         limit = to_tick(trigger * (1 + self.config.stop_limit_buffer_pct / 100.0), up=True)
@@ -1448,7 +1549,8 @@ class OptionsEngine:
         if ok:
             pos.stop_trigger_sent = trigger
             self._save_state()
-            logger.info("[%-2s] stop moved to %.2f (limit %.2f)", side, trigger, limit)
+            logger.info("[%-2s] stop moved to %.2f (limit %.2f)%s", side, trigger, limit,
+                        " — profit lock, parked at the exchange" if self._stop_is_lock(pos) else "")
         else:
             st = await self.broker.status_async(pos.stop_order_id)
             if st.status in ("PENDING", "TRANSIT") and st.filled_qty == 0:
@@ -1469,35 +1571,48 @@ class OptionsEngine:
     def _check_exits_live(self, side: str, leg: LegState, premium: float, squareoff_due: bool,
                           locked: bool = False) -> None:
         pos = leg.position
-        if pos is None or pos.closing:
-            return
+        if pos is None or pos.closing or pos.exit_pending:
+            return                       # an exit already decided is carried out by _poll_live_stops
         if squareoff_due:
-            pos.closing = True
+            pos.closing, pos.exit_pending = True, "EOD_SQUAREOFF"
             self._spawn(self._live_close(side, leg, "EOD_SQUAREOFF"))
             return
-        if locked and self._lock_is_tighter(pos):
-            # The profit lock lives in the engine (the exchange stop order stays
-            # the Heikin-Ashi stop): buy back now. _live_close cancels the
-            # exchange stop first, so the account can never be bought twice.
+        lock_hit = locked and self._lock_is_tighter(pos)
+        if lock_hit and not self._stop_is_lock(pos):
+            # The lock isn't parked at the exchange yet (price came straight
+            # back, or the move failed): buy back from here. _live_close cancels
+            # the exchange order first, so the account can never be bought twice.
             logger.info("[%-2s] profit lock %.2f reached at %.2f — buying back.", side, pos.lock_price, premium)
-            pos.closing = True
+            # Decided once, carried out until flat: if the first attempt can't
+            # finish (30-Sep 14:23: the stop's cancel was still in TRANSIT),
+            # _poll_live_stops retries every second — even if price has moved
+            # back below the lock by then.
+            pos.closing, pos.exit_pending = True, "PROFIT_LOCK"
+            self._save_state()
             self._spawn(self._live_close(side, leg, "PROFIT_LOCK"))
             return
-        if not pos.is_cover_level_triggered(premium):
+        if not lock_hit and not pos.is_cover_level_triggered(premium):
+            self._maybe_park_lock(side, leg, premium)
             return
+        reason = "PROFIT_LOCK" if lock_hit else "TRAILING_STOP"
         if not pos.stop_order_id:
-            pos.closing = True
-            self._spawn(self._live_close(side, leg, "TRAILING_STOP"))
+            pos.closing, pos.exit_pending = True, reason
+            self._spawn(self._live_close(side, leg, reason))
             return
-        # The exchange stop should be filling. Give it stop_escalate_secs;
-        # after that (it gapped past its limit) buy back at market ourselves.
+        # The order parked at the exchange (HA stop or profit lock) should be
+        # filling. Give it stop_escalate_secs; after that (it gapped past its
+        # limit) buy back at market ourselves.
         now = time.monotonic()
         if pos.breach_since is None:
-            pos.breach_since = now
-            logger.info("[%-2s] stop %.2f crossed at %.2f — exchange stop order should fill.", side, pos.cover_level, premium)
+            pos.breach_since, pos.breach_reason = now, reason
+            if lock_hit:
+                logger.info("[%-2s] profit lock %.2f crossed at %.2f — exchange order should fill.",
+                            side, pos.lock_price, premium)
+            else:
+                logger.info("[%-2s] stop %.2f crossed at %.2f — exchange stop order should fill.", side, pos.cover_level, premium)
         elif now - pos.breach_since >= self.config.stop_escalate_secs:
-            pos.closing = True
-            self._spawn(self._live_close(side, leg, "TRAILING_STOP"))
+            pos.closing, pos.exit_pending = True, pos.breach_reason or reason
+            self._spawn(self._live_close(side, leg, pos.exit_pending))
 
     async def _broker_net(self, security_id: str) -> Optional[Tuple[int, float]]:
         """(net qty, buy average) Dhan shows for this contract today, or None
@@ -1505,10 +1620,11 @@ class OptionsEngine:
         positions = await self.broker.positions_async()
         if positions is None:
             return None
-        for p in positions:
-            if str(p.get("securityId")) == str(security_id):
-                return int(float(p.get("netQty", 0) or 0)), float(p.get("buyAvg", 0) or 0)
-        return 0, 0.0
+        rows = [p for p in positions if str(p.get("securityId")) == str(security_id)]
+        # Summed: nothing in Dhan's docs promises one row per contract.
+        net = sum(int(float(p.get("netQty", 0) or 0)) for p in rows)
+        buy_avg = float(rows[0].get("buyAvg", 0) or 0) if len(rows) == 1 else 0.0
+        return net, buy_avg
 
     async def _closed_outside(self, side: str, leg: LegState) -> bool:
         """True (and the trade is booked) if Dhan shows this leg already flat —
@@ -1521,28 +1637,68 @@ class OptionsEngine:
         market BUY for the same reason. Now any buy-back or re-placed stop is
         preceded by asking Dhan whether the short still exists."""
         pos = leg.position
+        if pos is None or self._recent_fill(leg.security_id):
+            return False
         got = await self._broker_net(leg.security_id)
-        if pos is None or got is None:
+        if got is None or got[0] != 0:
+            return False
+        # Flat on one read isn't enough to stop managing a live short — Dhan's
+        # positions lag fills. Ask again a moment later.
+        await asyncio.sleep(_FLAT_CONFIRM_SECS)
+        if leg.position is not pos or self._recent_fill(leg.security_id):
+            return False
+        got = await self._broker_net(leg.security_id)
+        if got is None or got[0] != 0:
             return False
         net, buy_avg = got
-        if net != 0:
-            return False
         if pos.stop_order_id:
             st = await self.broker.status_async(pos.stop_order_id)
             if st.filled_qty >= pos.qty:
                 # Flat because OUR exchange stop filled — a normal stop-out,
                 # booked at the stop's own fill price, not a manual exit.
+                reason = self._stop_fill_reason(pos)
                 stop_id, pos.stop_order_id = pos.stop_order_id, ""
-                self._exit(side, leg, st.avg_price, "TRAILING_STOP", exit_order_id=stop_id)
+                self._exit(side, leg, st.avg_price, reason, exit_order_id=stop_id)
                 return True
             if st.status in ("PENDING", "TRANSIT", "TRIGGERED"):
                 await self.broker.cancel_async(pos.stop_order_id)     # it would open a LONG now
             pos.stop_order_id = ""
-        price = buy_avg if buy_avg > 0 else self._last_premium.get(side, pos.cover_level)
+        price, source = await self._outside_exit_price(side, leg, pos)
         logger.warning("[%-2s] position was closed OUTSIDE the engine (Dhan shows it flat) — booking the "
-                       "exit at Dhan's buy average %.2f; its protective stop is cancelled.", side, price)
+                       "exit at %.2f (%s); its protective stop is cancelled.", side, price, source)
         self._exit(side, leg, price, "CLOSED_OUTSIDE_ENGINE")
         return True
+
+    def _recent_fill(self, security_id: Optional[str]) -> bool:
+        at = self._last_fill_at.get(str(security_id)) if security_id else None
+        return at is not None and time.monotonic() - at < _POSITION_SETTLE_SECS
+
+    async def _outside_exit_price(self, side: str, leg: LegState, pos: OpenPosition) -> Tuple[float, str]:
+        """What the position was actually bought back at, from Dhan's trade
+        book: the BUY fills in this contract after the entry. BUG FIXED: this
+        used the positions' buy average, which covers the whole DAY — on
+        30-Sep it averaged in two earlier stop-outs (122.20, 126.00) and booked
+        a manual exit near 94.8 at 114.33, turning a ~Rs 1,000 win into a loss."""
+        trades = await self.broker.trades_async()
+        since = pos.entry_time - timedelta(seconds=1)
+        buys = []
+        for t in trades or []:
+            if str(t.get("securityId")) != str(leg.security_id) or str(t.get("transactionType", "")).upper() != "BUY":
+                continue
+            when = None
+            for key in ("exchangeTime", "updateTime", "createTime"):
+                try:
+                    when = datetime.strptime(str(t.get(key)), "%Y-%m-%d %H:%M:%S").replace(tzinfo=_IST)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            if when is not None and when >= since:
+                buys.append((when, int(float(t.get("tradedQuantity", 0) or 0)), float(t.get("tradedPrice", 0) or 0)))
+        buys = [b for b in sorted(buys) if b[1] > 0 and b[2] > 0]
+        if buys:
+            qty = sum(q for _, q, _ in buys)
+            return round(sum(q * p for _, q, p in buys) / qty, 2), f"Dhan trade book, {len(buys)} buy fill(s)"
+        return self._last_premium.get(side, pos.cover_level), "last traded price — Dhan's trade book had no matching buy"
 
     async def _check_foreign_positions(self) -> None:
         """Compare every NSE_FNO position at Dhan with what the engine itself
@@ -1556,11 +1712,21 @@ class OptionsEngine:
         mine = {leg.security_id: -leg.position.qty for leg in self.legs.values()
                 if leg.position is not None and leg.security_id}
         foreign = set()
+        nets: Dict[str, int] = {}
+        names: Dict[str, str] = {}
         for p in positions:
             if str(p.get("exchangeSegment", "")).upper() != self.config.option_exchange_segment:
                 continue
             sec = str(p.get("securityId"))
-            net = int(float(p.get("netQty", 0) or 0))
+            nets[sec] = nets.get(sec, 0) + int(float(p.get("netQty", 0) or 0))
+            names[sec] = str(p.get("tradingSymbol", "?"))
+        for sec, net in nets.items():
+            if self._recent_fill(sec):
+                # Dhan's positions can lag a fill by seconds (30-Sep 14:15:02
+                # showed net 0 for the short filled at 14:15:00).
+                if sec in self._foreign_contracts:
+                    foreign.add(sec)
+                continue
             if net != mine.get(sec, 0):
                 foreign.add(sec)
                 if sec not in self._foreign_contracts:
@@ -1568,7 +1734,7 @@ class OptionsEngine:
                     logger.critical(
                         "Dhan shows net %d in security %s (%s) but the engine holds %d there — a position the "
                         "engine didn't open, or one it lost track of. That contract is blocked for new entries; "
-                        "check the Dhan app.", net, sec, p.get("tradingSymbol", "?"), ours)
+                        "check the Dhan app.", net, sec, names.get(sec, "?"), ours)
                     self.ledger.log_event("FOREIGN_POSITION", details=f"security={sec} dhan_net={net} engine={ours}")
         self._foreign_contracts = foreign
 
@@ -1585,19 +1751,30 @@ class OptionsEngine:
             pos = leg.position
             if pos is None or pos.closing:
                 continue
+            if pos.exit_pending:
+                # An exit was decided but hasn't completed — keep at it. Never
+                # re-place the stop in this state (30-Sep 14:23: the stop's
+                # cancel was confirmed a moment late, the poll re-placed it,
+                # and the profit-lock buy-back never happened).
+                logger.warning("[%-2s] %s exit still pending — retrying the buy-back.", side, pos.exit_pending)
+                pos.closing = True
+                await self._live_close(side, leg, pos.exit_pending)
+                continue
             if check_positions and await self._closed_outside(side, leg):
                 continue
             if pos.stop_order_id:
                 st = await self.broker.status_async(pos.stop_order_id)
                 if st.status == "TRADED" and st.filled_qty >= pos.qty:
+                    reason = self._stop_fill_reason(pos)
                     stop_id = pos.stop_order_id
                     pos.stop_order_id = ""
-                    self._exit(side, leg, st.avg_price, "TRAILING_STOP", exit_order_id=stop_id)
+                    self._exit(side, leg, st.avg_price, reason, exit_order_id=stop_id)
                     continue
                 if st.status in ("REJECTED", "CANCELLED", "EXPIRED"):
+                    reason = self._stop_fill_reason(pos)
                     pos.stop_order_id, pos.stop_trigger_sent = "", 0.0
                     if st.filled_qty > 0:
-                        self._exit(side, leg, st.avg_price, "TRAILING_STOP", qty=st.filled_qty)
+                        self._exit(side, leg, st.avg_price, reason, qty=st.filled_qty)
                     # Cancelled by hand usually means closed by hand: never
                     # re-place a BUY stop into a position that's already flat.
                     if leg.position is not None and await self._closed_outside(side, leg):
@@ -1609,8 +1786,18 @@ class OptionsEngine:
                     continue
             if (pos.breach_since is not None
                     and time.monotonic() - pos.breach_since >= self.config.stop_escalate_secs):
-                pos.closing = True
-                await self._live_close(side, leg, "TRAILING_STOP")
+                pos.closing, pos.exit_pending = True, pos.breach_reason or "TRAILING_STOP"
+                await self._live_close(side, leg, pos.exit_pending)
+
+    async def _settled_status(self, order_id: str) -> OrderResult:
+        """The order's status once it has stopped changing (a cancel can sit
+        in TRANSIT for a moment), or the latest after _CANCEL_SETTLE_SECS."""
+        deadline = time.monotonic() + _CANCEL_SETTLE_SECS
+        while True:
+            st = await self.broker.status_async(order_id)
+            if st.status in _ORDER_DONE or time.monotonic() >= deadline:
+                return st
+            await asyncio.sleep(0.2)
 
     async def _live_close(self, side: str, leg: LegState, reason: str) -> None:
         """Buy the leg back for real. Cancels the exchange stop FIRST and
@@ -1624,20 +1811,21 @@ class OptionsEngine:
             remaining = pos.qty
             if pos.stop_order_id:
                 ok, msg = await self.broker.cancel_async(pos.stop_order_id)
-                st = await self.broker.status_async(pos.stop_order_id)
+                st = await self._settled_status(pos.stop_order_id)
                 if st.filled_qty > 0:
+                    fill_reason = self._stop_fill_reason(pos)
                     stop_id = pos.stop_order_id
                     filled = min(st.filled_qty, pos.qty)
                     pos.stop_order_id = "" if filled >= pos.qty else pos.stop_order_id
-                    self._exit(side, leg, st.avg_price, "TRAILING_STOP", exit_order_id=stop_id, qty=filled)
+                    self._exit(side, leg, st.avg_price, fill_reason, exit_order_id=stop_id, qty=filled)
                     if leg.position is None:
                         return
                     remaining = leg.position.qty
                 if st.status not in ("CANCELLED", "TRADED", "REJECTED", "EXPIRED"):
                     # The stop is still live and couldn't be cancelled: sending
                     # a market buy now could double the buy-back. Retry shortly.
-                    logger.critical("[%-2s] could not cancel exchange stop %s (%s: %s) — will retry.",
-                                    side, pos.stop_order_id, st.status, msg)
+                    logger.critical("[%-2s] exchange stop %s still %s %.0fs after the cancel (%s) — retrying.",
+                                    side, pos.stop_order_id, st.status, _CANCEL_SETTLE_SECS, msg)
                     return
                 pos.stop_order_id = ""
             if await self._closed_outside(side, leg):
@@ -1662,9 +1850,11 @@ class OptionsEngine:
                             "(Token / Trading API access / network.)")
             self.stop()
             return
-        broker = {str(p.get("securityId")): int(float(p.get("netQty", 0) or 0)) for p in positions
-                  if str(p.get("exchangeSegment", "")).upper() == self.config.option_exchange_segment}
-        buy_avg = {str(p.get("securityId")): float(p.get("buyAvg", 0) or 0) for p in positions}
+        broker: Dict[str, int] = {}
+        for p in positions:
+            if str(p.get("exchangeSegment", "")).upper() == self.config.option_exchange_segment:
+                sec = str(p.get("securityId"))
+                broker[sec] = broker.get(sec, 0) + int(float(p.get("netQty", 0) or 0))
         known = set()
         for side in _LEGS:
             leg = self.legs[side]
@@ -1683,16 +1873,17 @@ class OptionsEngine:
                     await self._place_protective_stop(side, leg)
             elif net == 0:
                 st = await self.broker.status_async(pos.stop_order_id) if pos.stop_order_id else None
-                # BUG FIXED: a hand-closed position used to be booked at the
-                # engine's STOP LEVEL (e.g. 131.30) instead of the real price
-                # it was bought back at (123.60). Dhan's buy average for the
-                # contract is the actual price.
-                price = (buy_avg.get(leg.security_id) or 0.0) or (st.avg_price if st and st.filled_qty else 0.0) \
-                    or pos.cover_level
+                # The real buy-back price: the stop's own fill if it filled,
+                # else the BUY fills after entry in Dhan's trade book — never
+                # the positions' buy average, which covers the whole day.
+                if st and st.filled_qty >= pos.qty and st.avg_price > 0:
+                    price, source = st.avg_price, "the exchange stop's fill"
+                else:
+                    price, source = await self._outside_exit_price(side, leg, pos)
                 if st and st.status in ("PENDING", "TRANSIT", "TRIGGERED"):
                     await self.broker.cancel_async(pos.stop_order_id)   # flat now: it could only open a LONG
                 logger.warning("[%-2s] Dhan shows this position already CLOSED (stop filled or closed by hand "
-                               "while the engine was down) — booking it at Dhan's price %.2f.", side, price)
+                               "while the engine was down) — booking it at %.2f (%s).", side, price, source)
                 pos.stop_order_id = ""
                 self._exit(side, leg, price, "CLOSED_WHILE_OFFLINE")
             else:
@@ -1781,6 +1972,9 @@ class OptionsEngine:
         self.ledger.log_event("PROFIT_LOCK_SET", symbol=side,
                               details=f"entry={pos.entry_price:.2f} best={price:.2f} lock={lock:.2f}")
         self._save_state()
+        if self.broker is not None:
+            pos.lock_park_tried_at = 0.0
+            self._maybe_park_lock(side, leg, self._last_premium.get(side, price))
 
     def _exit(
         self, side: str, leg: LegState, exit_price: float, reason: str,

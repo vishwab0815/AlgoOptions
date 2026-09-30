@@ -1,9 +1,9 @@
 """
 run_options.py — standalone entry point for the NIFTY options engine.
 
-Pure paper trading: market data (option chain, expiry, margin, and
-real-time premium ticks) comes from the live DhanHQ API; no order is ever
-placed anywhere in this codebase.
+OPTIONS_PAPER_TRADING=true -> paper (simulated fills at live prices);
+false -> LIVE: real orders on Dhan. Market data (option chain, expiry,
+margin, candles, real-time premium ticks) always comes from DhanHQ.
 
 Logs stream to both console AND data/options_engine.log for monitoring.
 
@@ -11,7 +11,9 @@ Usage:
     python run_options.py
 """
 import asyncio
+import atexit
 import logging
+import queue
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -56,14 +58,41 @@ _root.setLevel(logging.INFO)
 
 _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(_ShortNameFormatter(_FMT, datefmt=_DATE_FMT))
-_root.addHandler(_console)
 
-from logging.handlers import RotatingFileHandler as _RFH
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler as _RFH
 _file_handler = _RFH(str(LOG_FILE), maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
 _file_handler.setFormatter(_ShortNameFormatter(
     "%(asctime)s [%(levelname)s] %(shortname)-11s: %(message)s"
 ))
-_root.addHandler(_file_handler)
+
+# LATENCY: logging never runs on the trading loop. Writing a line to the
+# console and the file used to happen right there, inside the tick / candle-
+# close / order code: 0.05 ms normally, 6-44 ms on a slow console (measured),
+# and on Windows a click inside the console window (QuickEdit) blocks every
+# write — which froze the WHOLE engine (ticks, stop checks, candle closes)
+# until a key was pressed. Now a log call only queues the record (~0.03 ms)
+# and a background thread writes it. Each destination has its own queue and
+# thread, so a paused console can't hold up the log file either. Timestamps
+# are taken when the line is logged, not when it's written.
+_log_listeners = []
+for _handler in (_console, _file_handler):
+    _q = queue.SimpleQueue()
+    _root.addHandler(QueueHandler(_q))
+    _listener = QueueListener(_q, _handler)
+    _listener.start()
+    _log_listeners.append(_listener)
+
+
+def _flush_logs() -> None:
+    """Write out everything still queued (runs at exit, Ctrl+C included)."""
+    for listener in _log_listeners:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_flush_logs)
 
 # Third-party libraries are noisy at INFO and add nothing here.
 for _noisy in ("urllib3", "websockets", "asyncio"):
@@ -90,6 +119,30 @@ def _high_resolution_timers() -> None:
 
 
 _high_resolution_timers()
+
+
+def _disable_console_quick_edit() -> None:
+    """Windows: a click inside the console window starts a text selection
+    (QuickEdit) that PAUSES the program's console output until a key is
+    pressed. Logging no longer runs on the trading loop, so that can't freeze
+    trading any more — but the console would still stop updating. Turned off
+    for this window only (right-click still pastes; Mark via the window menu
+    still copies). No-op elsewhere, or when there is no console."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)             # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+            kernel32.SetConsoleMode(handle, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
+
+
+_disable_console_quick_edit()
 
 
 def _token_status_line(config) -> str:
@@ -156,7 +209,7 @@ def _print_banner(config) -> None:
         f"│  {'sizing':<18} floor(capital / {config.max_concurrent} / live DhanHQ margin-per-lot)",
         _section("STRATEGY"),
         f"│  {'entry':<18} HA GREEN -> RED -> RED breakout, sell-to-open only",
-        f"│  {'gates':<18} pattern only — no RSI, no volume, no ratchet",
+        f"│  {'gates':<18} pattern only — no RSI, no volume filter",
         f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open",
         f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
         f"│  {'entries':<18} from {config.entry_start} IST, none after 15:00",
@@ -173,8 +226,8 @@ def _print_banner(config) -> None:
             f"│  {'account':<18} Dhan client {config.client_id}, product INTRADAY, NSE_FNO",
             f"│  {'entry / exit':<18} {config.live_order_type}"
             + (f" (limit {config.live_limit_buffer_pct:.1f}% through the last price)" if config.live_order_type == "LIMIT" else ""),
-            f"│  {'protective stop':<18} stop-limit AT THE EXCHANGE at the engine's stop level, "
-            f"limit +{config.stop_limit_buffer_pct:.0f}%; moved every candle",
+            f"│  {'protective stop':<18} stop-limit AT THE EXCHANGE at the closer of the HA stop and the "
+            f"profit lock, limit +{config.stop_limit_buffer_pct:.0f}%",
             f"│  {'escalation':<18} stop crossed but unfilled after {config.stop_escalate_secs:.0f}s -> market buy-back",
             f"│  {'max lots':<18} {config.live_max_lots} per trade (hard cap)",
             f"│  {'daily loss limit':<18} Rs {config.max_daily_loss:,.0f} net — no new trades after it",

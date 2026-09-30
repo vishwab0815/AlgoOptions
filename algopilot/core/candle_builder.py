@@ -59,6 +59,13 @@ class CandleBuilder:
         self._current_start: Optional[datetime] = None
         self._current: Optional[Dict[str, float]] = None
         self._last_close_price: Optional[float] = None
+        # Start of the last bucket handed out (real or synthetic). BUG FIXED
+        # (30-Sep live): the candle clock closes a candle AT the boundary,
+        # which leaves no candle in progress; a tick stamped just BEFORE the
+        # boundary that arrived just after it then re-opened the old bucket,
+        # and the next tick closed it a SECOND time — CE 12:50-12:55 and
+        # 13:30-13:35 were evaluated twice, adding a bogus Heikin-Ashi row.
+        self._last_closed_start: Optional[datetime] = None
         # Ticks dropped for arriving with a timestamp earlier than the candle
         # already in progress (see the else branch in update_from_tick) —
         # exposed for visibility/telemetry, not currently read anywhere else.
@@ -110,6 +117,7 @@ class CandleBuilder:
         )
 
         self._last_close_price = candle.close
+        self._last_closed_start = candle.start_ts
         self._current_start = None
         self._current = None
         return candle
@@ -138,6 +146,9 @@ class CandleBuilder:
         bucket_start = self._floor_to_timeframe(ts)
 
         if self._current_start is None:
+            if self._last_closed_start is not None and bucket_start <= self._last_closed_start:
+                self.dropped_out_of_order_ticks += 1      # belongs to a candle already closed
+                return closed
             self._new_current_candle(bucket_start, price, volume)
             return closed
 
@@ -164,6 +175,7 @@ class CandleBuilder:
                     synthetic = self._create_synthetic_candle(next_bucket, self._last_close_price)
                     closed.append(synthetic)
                     self._last_close_price = synthetic.close
+                    self._last_closed_start = synthetic.start_ts
 
                 next_bucket = datetime.fromtimestamp(
                     next_bucket.timestamp() + self.timeframe_seconds, tz=timezone.utc
@@ -224,6 +236,7 @@ class CandleBuilder:
                 synthetic = self._create_synthetic_candle(next_bucket, self._last_close_price)
                 closed.append(synthetic)
                 self._last_close_price = synthetic.close
+                self._last_closed_start = synthetic.start_ts
             next_bucket = datetime.fromtimestamp(
                 next_bucket.timestamp() + self.timeframe_seconds, tz=timezone.utc
             )

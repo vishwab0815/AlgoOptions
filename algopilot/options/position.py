@@ -46,7 +46,12 @@ class OpenPosition:
     stop_order_id: str = ""       # protective stop-limit resting at the exchange
     stop_trigger_sent: float = 0.0  # trigger that order currently carries
     closing: bool = False         # a buy-back is in flight — never start a second
+    exit_pending: str = ""        # an exit was decided (reason); retried until flat
     breach_since: Optional[float] = None  # monotonic time price first crossed the stop
+    breach_reason: str = ""       # which level was crossed: TRAILING_STOP / PROFIT_LOCK
+    stop_syncing: bool = False    # a move of the exchange order is in flight
+    stop_resync: bool = False     # ...and another was asked for meanwhile
+    lock_park_tried_at: float = 0.0  # monotonic time of the last attempt to park the lock
 
     @property
     def rules(self):

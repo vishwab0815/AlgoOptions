@@ -35,8 +35,8 @@ orders**, recording everything in a local SQLite ledger.
    price every 5 s as a backup.
 8. **Profit lock** — sold at 123: once the premium touches 113 (10 points),
    buy back if it comes back to 113; at 110 the lock stays 113; at 107 it moves
-   to 110; at 104 to 107 — every 3 points, one step behind the best. Watched on
-   every tick by the engine (the exchange stop order stays the HA stop).
+   to 110; at 104 to 107 — every 3 points, one step behind the best. Live, the
+   lock is parked AT THE EXCHANGE (see below); the engine also watches every tick.
 9. **Exit** — stop hit, profit lock hit, or everything bought back at 15:00.
 9. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
    (rates in `.env`, estimates — check a contract note).
@@ -44,9 +44,12 @@ orders**, recording everything in a local SQLite ledger.
 ## Live mode
 
 - Entry: market SELL; the exchange's actual fill price and quantity are recorded.
-- A **stop-limit BUY rests at the exchange** at the engine's stop level and is
-  moved every candle — you stay protected even if the engine or VM stops.
+- A **stop-limit BUY rests at the exchange** at whichever is closer to the price:
+  the HA stop (moved every candle) or the profit lock (moved as soon as a new
+  lock is set, once the price is below it). The exchange fills it the moment
+  price touches it, and you stay protected even if the engine or VM stops.
   If price gaps past its limit, the engine cancels it and buys back at market.
+  If the lock isn't parked yet when price comes back, the engine buys back itself.
 - Hard cap of 1 lot (`OPTIONS_LIVE_MAX_LOTS`), daily loss limit
   (`OPTIONS_MAX_DAILY_LOSS`, default ₹3,000).
 - On restart it checks Dhan's real positions before trading.
