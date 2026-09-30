@@ -51,7 +51,7 @@ import uuid
 from dataclasses import dataclass, field, replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from ..core.candle_builder import Candle, CandleBuilder
@@ -62,7 +62,7 @@ from ..utils.market_hours import get_market_status
 from .config import OptionsConfig
 from .dhan_client import OptionsDhanClient
 from .ledger import OptionsLedger
-from .broker import DhanBroker, OrderResult, new_tag, to_tick
+from .broker import DhanBroker, OrderResult, OrderUpdateStream, new_tag, to_tick
 from .charges import ChargeRates, round_trip_charges
 from .position import OpenPosition, trailing_exit_level
 from .websocket import OptionsWebSocketManager
@@ -97,6 +97,11 @@ _BAND_HYSTERESIS_POINTS = 15.0
 # miss measured was 0.03 ms. Cost: ~60 ms of spinning per 5-minute candle.
 _CLOCK_SPIN_SECS = 0.060
 
+# Live: warm the order connection this long before each candle close if it
+# hasn't been used for _WARM_IF_IDLE_SECS (Dhan keeps an idle one open >100 s).
+_WARM_BEFORE_SECS = 2.0
+_WARM_IF_IDLE_SECS = 20.0
+
 # Calendar days of earlier sessions fetched to continue the Heikin-Ashi series
 # (see _backfill_leg). 5 covers a weekend plus a holiday; one full session is
 # already enough — the seed's influence halves with every candle.
@@ -114,6 +119,10 @@ KILL_SWITCH_FILE = Path("data/KILL")
 
 # Live mode: how often the broker's available funds are re-read (seconds).
 _FUNDS_REFRESH_SECS = 60.0
+
+# Live mode: how often an open position is checked against Dhan's positions,
+# to notice a position closed OUTSIDE the engine (by hand in the Dhan app).
+_POSITION_CHECK_SECS = 5.0
 
 # Refresh a leg's cached margin this long before its 15-minute cache expires.
 _MARGIN_REFRESH_SECS = 600.0
@@ -216,6 +225,10 @@ class OptionsEngine:
         )
         self._broker_funds: Optional[float] = None
         self._funds_checked_at = 0.0
+        self._positions_checked_at = 0.0
+        # Contracts where Dhan's position differs from the engine's (manual
+        # trades etc.) — re-checked every few seconds, see _check_foreign_positions.
+        self._foreign_contracts: set = set()
         # Contracts where Dhan shows a position this engine didn't open — it
         # won't trade them (see _reconcile_live).
         self._blocked_contracts: set = set()
@@ -246,8 +259,17 @@ class OptionsEngine:
 
     @property
     def band_frozen(self) -> bool:
-        """The strike band structurally refuses to move while any leg is open."""
-        return any(leg.position is not None for leg in self.legs.values())
+        """The strike band refuses to move while a position is open OR an entry
+        order is still in flight.
+
+        BUG FIXED: this only checked for a RECORDED position. A live SELL takes
+        ~0.2-0.3 s from send to confirmed fill, and the position is recorded
+        only after that — so a strike switch inside that window replaced the
+        legs, the fill was then attached to the discarded old leg, and the
+        engine lost a real short: no trailing stop, no 15:00 buy-back, not in
+        saved state (reproduced in a test before this fix)."""
+        return (self._entry_in_flight is not None
+                or any(leg.position is not None for leg in self.legs.values()))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -278,6 +300,11 @@ class OptionsEngine:
         # loop (a chain poll mid-HTTP, a backfill) can ever sit in front of
         # the boundary. See _candle_clock().
         self._spawn(self._candle_clock())
+        if self.broker is not None:
+            # Fills are PUSHED by Dhan (see broker.OrderUpdateStream) — the
+            # fast way to know an order filled; REST polling stays as fallback.
+            self.broker.stream = OrderUpdateStream(self.config.client_id, self.config.access_token)
+            self._spawn(self.broker.stream.run())
 
         if had_prior_state:
             # Band/position came from a restart, not from maintenance_tick's
@@ -298,6 +325,8 @@ class OptionsEngine:
                 self.ws_manager.stop()
             self.client.close()
             if self.broker is not None:
+                if self.broker.stream is not None:
+                    await self.broker.stream.stop()
                 self.broker.close()
             self.ledger.close()
 
@@ -318,6 +347,14 @@ class OptionsEngine:
         while self._running:
             boundary = (time.time() // tf + 1) * tf
             target = boundary + grace
+            if self.broker is not None:
+                # Make sure the HTTPS connection to Dhan's order server is OPEN
+                # when the order goes out: a fresh connection measured 327 ms,
+                # an open one 39 ms. The 5 s position check normally keeps it
+                # open; this covers the case where that has been quiet.
+                await asyncio.sleep(max(0.0, boundary - _WARM_BEFORE_SECS - time.time()))
+                if time.monotonic() - self.broker.last_call_at > _WARM_IF_IDLE_SECS:
+                    self._spawn(self.broker.keep_warm_async())
             await asyncio.sleep(max(0.0, target - time.time() - _CLOCK_SPIN_SECS))
             while time.time() < target:
                 await asyncio.sleep(0)       # yields, so ticks keep flowing while we wait
@@ -417,6 +454,12 @@ class OptionsEngine:
             leg = self.legs[side]
             leg.strike = self.call_strike if side == "CE" else self.put_strike
             await self._ensure_contract_async(side, leg)
+        if self.broker is not None:
+            # New strikes: is there already a position in them that the engine
+            # didn't open (e.g. your manual trade)? Then don't trade them.
+            await self._check_foreign_positions()
+        for side in _LEGS:
+            leg = self.legs[side]
             if leg.security_id:
                 subscriptions.append((_NSE_FNO_SEGMENT_CODE, leg.security_id))
                 await self._backfill_leg(side, leg)
@@ -950,9 +993,16 @@ class OptionsEngine:
         )
 
     async def _on_candle_close(self, side: str, leg: LegState, candle: Candle, squareoff_due: bool) -> None:
+        if leg is not self.legs.get(side):
+            return          # a candle of strikes the engine has already moved off
         if leg.partial_bucket is not None and candle.start_ts == leg.partial_bucket:
             leg.partial_bucket = None
             candle = await self._complete_partial_candle(side, leg, candle)
+            if leg is not self.legs.get(side):
+                # Strikes changed while the full candle was being fetched: the
+                # old strike's signal must not be traded after the engine left it.
+                logger.info("[%-2s] strikes changed during the candle fetch — old strike's candle dropped.", side)
+                return
         ha_row = leg.ha_engine.append_candle(candle.as_dict())
         candle_index = len(leg.ha_engine.df) - 1
 
@@ -1067,6 +1117,8 @@ class OptionsEngine:
         if self.config.max_daily_loss > 0 and self.realized_pnl <= -self.config.max_daily_loss:
             return (f"daily loss limit reached (net Rs {self.realized_pnl:.2f}, "
                     f"limit Rs -{self.config.max_daily_loss:.0f})")
+        if leg.security_id in self._foreign_contracts:
+            return "Dhan shows a position in this contract that the engine did not open - not trading it"
         if leg.security_id in self._blocked_contracts:
             return "Dhan shows a position in this contract that the engine did not open - blocked"
         if leg.position is not None:
@@ -1107,11 +1159,17 @@ class OptionsEngine:
         at_time: Optional[datetime] = None, signal_price: Optional[float] = None,
         decided: str = "",
     ) -> None:
+        if leg is not self.legs.get(side):
+            logger.warning("[%-2s] signal dropped: strikes changed before the order could be sent.", side)
+            return
         lot_size = leg.lot_size or self.config.lot_size
         per_lot_margin, is_live = await self.client.margin_per_lot_async(
             leg.security_id, self.config.option_exchange_segment, entry_price,
             lot_size, self.config.fallback_margin_per_lot,
         )
+        if leg is not self.legs.get(side):
+            logger.warning("[%-2s] signal dropped: strikes changed before the order could be sent.", side)
+            return
         capital = self.balance
         if self.broker is not None and self._broker_funds is not None:
             # Never size beyond what the account actually has free.
@@ -1178,6 +1236,7 @@ class OptionsEngine:
         )
         if self.broker is not None:
             await self._place_protective_stop(side, leg)
+            self._spawn(self._verify_entry_price(side, leg, entry_order_id, entry_price))
 
     # ── Live order handling (only reachable when self.broker is set) ──────────
 
@@ -1194,11 +1253,27 @@ class OptionsEngine:
                               details=f"{txn} x{qty} {order_type} price={price:.2f} order={order_id} {msg}")
         if order_id is None:
             return OrderResult(None, "REJECTED", message=msg)
-        res = await self.broker.wait_for_fill(order_id)
+        # SELL (entry): act on the pushed fill at once — the protective stop
+        # goes in right after, so every ms here is time unprotected; the price
+        # is re-checked over REST in the background (_verify_entry_price).
+        # BUY (exit): re-read the exact fill, since it's booked into the trade.
+        res = await self.broker.wait_for_fill(order_id, exact=(txn == "BUY"))
         self.ledger.log_event("ORDER_RESULT", symbol=side,
                               details=f"{txn} order={order_id} status={res.status} filled={res.filled_qty} "
                                       f"avg={res.avg_price:.2f} {res.message}")
         return res
+
+    async def _verify_entry_price(self, side: str, leg: LegState, order_id: str, pushed_price: float) -> None:
+        """The entry was confirmed from Dhan's push; confirm its average price
+        over REST too, and correct the position if they differ."""
+        st = await self.broker.status_async(order_id)
+        pos = leg.position
+        if pos is None or pos.entry_order_id != order_id or st.avg_price <= 0:
+            return
+        if abs(st.avg_price - pushed_price) > 1e-6:
+            logger.info("[%-2s] entry price corrected from Dhan's order book: %.2f -> %.2f", side, pushed_price, st.avg_price)
+            pos.entry_price = st.avg_price
+            self._save_state()
 
     async def _place_protective_stop(self, side: str, leg: LegState) -> None:
         pos = leg.position
@@ -1282,13 +1357,93 @@ class OptionsEngine:
             pos.closing = True
             self._spawn(self._live_close(side, leg, "TRAILING_STOP"))
 
+    async def _broker_net(self, security_id: str) -> Optional[Tuple[int, float]]:
+        """(net qty, buy average) Dhan shows for this contract today, or None
+        if Dhan couldn't be read. A short is negative; 0 = flat."""
+        positions = await self.broker.positions_async()
+        if positions is None:
+            return None
+        for p in positions:
+            if str(p.get("securityId")) == str(security_id):
+                return int(float(p.get("netQty", 0) or 0)), float(p.get("buyAvg", 0) or 0)
+        return 0, 0.0
+
+    async def _closed_outside(self, side: str, leg: LegState) -> bool:
+        """True (and the trade is booked) if Dhan shows this leg already flat —
+        i.e. it was bought back outside the engine, by hand in the Dhan app.
+
+        BUG FIXED: the engine only ever learned about its OWN orders. After a
+        manual exit it still believed it was short, so it (a) re-placed the
+        stop when it found it cancelled — a stop that, if triggered, would BUY
+        65 into a flat account = an unintended LONG — and (b) at 15:00 sent a
+        market BUY for the same reason. Now any buy-back or re-placed stop is
+        preceded by asking Dhan whether the short still exists."""
+        pos = leg.position
+        got = await self._broker_net(leg.security_id)
+        if pos is None or got is None:
+            return False
+        net, buy_avg = got
+        if net != 0:
+            return False
+        if pos.stop_order_id:
+            st = await self.broker.status_async(pos.stop_order_id)
+            if st.filled_qty >= pos.qty:
+                # Flat because OUR exchange stop filled — a normal stop-out,
+                # booked at the stop's own fill price, not a manual exit.
+                stop_id, pos.stop_order_id = pos.stop_order_id, ""
+                self._exit(side, leg, st.avg_price, "TRAILING_STOP", exit_order_id=stop_id)
+                return True
+            if st.status in ("PENDING", "TRANSIT", "TRIGGERED"):
+                await self.broker.cancel_async(pos.stop_order_id)     # it would open a LONG now
+            pos.stop_order_id = ""
+        price = buy_avg if buy_avg > 0 else self._last_premium.get(side, pos.cover_level)
+        logger.warning("[%-2s] position was closed OUTSIDE the engine (Dhan shows it flat) — booking the "
+                       "exit at Dhan's buy average %.2f; its protective stop is cancelled.", side, price)
+        self._exit(side, leg, price, "CLOSED_OUTSIDE_ENGINE")
+        return True
+
+    async def _check_foreign_positions(self) -> None:
+        """Compare every NSE_FNO position at Dhan with what the engine itself
+        holds. Anything else — a manual trade, or a position the engine lost —
+        blocks that contract for new entries and raises a CRITICAL alert once.
+        The engine does NOT take over positions it didn't open: that's your
+        call, and the protective stop placed at entry stays at the exchange."""
+        positions = await self.broker.positions_async()
+        if positions is None:
+            return
+        mine = {leg.security_id: -leg.position.qty for leg in self.legs.values()
+                if leg.position is not None and leg.security_id}
+        foreign = set()
+        for p in positions:
+            if str(p.get("exchangeSegment", "")).upper() != self.config.option_exchange_segment:
+                continue
+            sec = str(p.get("securityId"))
+            net = int(float(p.get("netQty", 0) or 0))
+            if net != mine.get(sec, 0):
+                foreign.add(sec)
+                if sec not in self._foreign_contracts:
+                    ours = mine.get(sec, 0)
+                    logger.critical(
+                        "Dhan shows net %d in security %s (%s) but the engine holds %d there — a position the "
+                        "engine didn't open, or one it lost track of. That contract is blocked for new entries; "
+                        "check the Dhan app.", net, sec, p.get("tradingSymbol", "?"), ours)
+                    self.ledger.log_event("FOREIGN_POSITION", details=f"security={sec} dhan_net={net} engine={ours}")
+        self._foreign_contracts = foreign
+
     async def _poll_live_stops(self) -> None:
         """Once a second: did an exchange stop fill? Did one vanish? Does a
-        crossed stop need escalating even though no new tick has arrived?"""
+        crossed stop need escalating even though no new tick has arrived?
+        Every few seconds: is the position still open at Dhan at all?"""
+        check_positions = time.monotonic() - self._positions_checked_at >= _POSITION_CHECK_SECS
+        if check_positions:
+            self._positions_checked_at = time.monotonic()
+            await self._check_foreign_positions()
         for side in _LEGS:
             leg = self.legs[side]
             pos = leg.position
             if pos is None or pos.closing:
+                continue
+            if check_positions and await self._closed_outside(side, leg):
                 continue
             if pos.stop_order_id:
                 st = await self.broker.status_async(pos.stop_order_id)
@@ -1298,12 +1453,16 @@ class OptionsEngine:
                     self._exit(side, leg, st.avg_price, "TRAILING_STOP", exit_order_id=stop_id)
                     continue
                 if st.status in ("REJECTED", "CANCELLED", "EXPIRED"):
-                    logger.critical("[%-2s] exchange stop %s is %s (%s) — re-placing it.",
-                                    side, pos.stop_order_id, st.status, st.message)
                     pos.stop_order_id, pos.stop_trigger_sent = "", 0.0
                     if st.filled_qty > 0:
                         self._exit(side, leg, st.avg_price, "TRAILING_STOP", qty=st.filled_qty)
+                    # Cancelled by hand usually means closed by hand: never
+                    # re-place a BUY stop into a position that's already flat.
+                    if leg.position is not None and await self._closed_outside(side, leg):
+                        continue
                     if leg.position is not None:
+                        logger.critical("[%-2s] exchange stop is %s (%s) but Dhan still shows the short — "
+                                        "re-placing it.", side, st.status, st.message)
                         await self._place_protective_stop(side, leg)
                     continue
             if (pos.breach_since is not None
@@ -1339,6 +1498,8 @@ class OptionsEngine:
                                     side, pos.stop_order_id, st.status, msg)
                     return
                 pos.stop_order_id = ""
+            if await self._closed_outside(side, leg):
+                return                     # already flat at Dhan: a BUY now would make it LONG
             ref = self._last_premium.get(side, pos.cover_level)
             res = await self._live_order("BUY", side, leg, remaining, ref_price=ref)
             if res.filled_qty > 0:
@@ -1361,6 +1522,7 @@ class OptionsEngine:
             return
         broker = {str(p.get("securityId")): int(float(p.get("netQty", 0) or 0)) for p in positions
                   if str(p.get("exchangeSegment", "")).upper() == self.config.option_exchange_segment}
+        buy_avg = {str(p.get("securityId")): float(p.get("buyAvg", 0) or 0) for p in positions}
         known = set()
         for side in _LEGS:
             leg = self.legs[side]
@@ -1379,9 +1541,16 @@ class OptionsEngine:
                     await self._place_protective_stop(side, leg)
             elif net == 0:
                 st = await self.broker.status_async(pos.stop_order_id) if pos.stop_order_id else None
-                price = st.avg_price if st and st.filled_qty else pos.cover_level
+                # BUG FIXED: a hand-closed position used to be booked at the
+                # engine's STOP LEVEL (e.g. 131.30) instead of the real price
+                # it was bought back at (123.60). Dhan's buy average for the
+                # contract is the actual price.
+                price = (buy_avg.get(leg.security_id) or 0.0) or (st.avg_price if st and st.filled_qty else 0.0) \
+                    or pos.cover_level
+                if st and st.status in ("PENDING", "TRANSIT", "TRIGGERED"):
+                    await self.broker.cancel_async(pos.stop_order_id)   # flat now: it could only open a LONG
                 logger.warning("[%-2s] Dhan shows this position already CLOSED (stop filled or closed by hand "
-                               "while the engine was down) — booking it at %.2f.", side, price)
+                               "while the engine was down) — booking it at Dhan's price %.2f.", side, price)
                 pos.stop_order_id = ""
                 self._exit(side, leg, price, "CLOSED_WHILE_OFFLINE")
             else:

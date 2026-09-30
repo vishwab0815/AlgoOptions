@@ -25,6 +25,7 @@ Rules this module keeps no matter what:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -45,6 +46,7 @@ force_ipv4()
 logger = logging.getLogger(__name__)
 
 _BASE = "https://api.dhan.co/v2"
+_ORDER_UPDATE_WSS = "wss://api-order-update.dhan.co"   # dhanhq.co/docs/v2/order-update/
 _TICK = 0.05
 _FINAL = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
 
@@ -61,6 +63,101 @@ def new_tag() -> str:
     """correlationId: our own id on every order, so a placement whose response
     was lost can still be found instead of being re-sent."""
     return "AP" + uuid.uuid4().hex[:16]
+
+
+class OrderUpdateStream:
+    """Dhan's Live Order Update WebSocket: Dhan PUSHES every change to your
+    orders (TRANSIT -> PENDING -> TRADED, fill price, qty) the moment it
+    happens. Waiting on this instead of asking "is it filled yet?" over REST
+    every 250 ms is what makes fill confirmation fast.
+
+    Written here rather than using dhanhq.orderupdate.OrderUpdate, which
+    print()s the login message INCLUDING YOUR ACCESS TOKEN to the console and
+    never reconnects. This one logs nothing secret and reconnects on its own.
+    Fields are read case-insensitively (the docs write OrderNo/Status, the SDK
+    reads orderNo/status)."""
+
+    def __init__(self, client_id: str, access_token: SecretStr) -> None:
+        self._client_id = str(client_id)
+        self._token = access_token
+        self._updates: Dict[str, dict] = {}
+        self._events: Dict[str, asyncio.Event] = {}
+        self._stop = False
+        self.connected = False
+        self._ws = None
+
+    async def run(self) -> None:
+        import websockets
+        delay = 1.0
+        while not self._stop:
+            try:
+                async with websockets.connect(_ORDER_UPDATE_WSS, ping_interval=20, ping_timeout=20,
+                                              open_timeout=10) as ws:
+                    self._ws = ws
+                    await ws.send(json.dumps({"LoginReq": {"MsgCode": 42, "ClientId": self._client_id,
+                                                           "Token": self._token.get_secret()},
+                                              "UserType": "SELF"}))
+                    self.connected, delay = True, 1.0
+                    logger.info("Order-update stream connected (fills are pushed by Dhan).")
+                    async for raw in ws:
+                        self._on_message(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._stop:
+                    logger.warning("Order-update stream dropped (%s) — reconnecting in %.0fs; "
+                                   "fills are still confirmed over REST meanwhile.", type(exc).__name__, delay)
+            finally:
+                self.connected, self._ws = False, None
+            if not self._stop:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10.0)
+
+    async def stop(self) -> None:
+        self._stop = True
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+
+    def _on_message(self, raw) -> None:
+        try:
+            msg = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if str(msg.get("Type", "")).lower() != "order_alert":
+            return
+        data = {str(k).lower(): v for k, v in (msg.get("Data") or {}).items()}
+        oid = str(data.get("orderno") or "")
+        if not oid:
+            return
+        self._updates[oid] = data
+        ev = self._events.get(oid)
+        if ev is not None:
+            ev.set()
+
+    def latest(self, order_id: str) -> Optional[dict]:
+        return self._updates.get(str(order_id))
+
+    async def wait_change(self, order_id: str, timeout: float) -> None:
+        ev = self._events.setdefault(str(order_id), asyncio.Event())
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        ev.clear()
+
+    @staticmethod
+    def to_result(order_id: str, data: dict) -> "OrderResult":
+        status = str(data.get("status", "")).upper()
+        qty = int(float(data.get("quantity", 0) or 0))
+        traded = int(float(data.get("tradedqty", 0) or 0))
+        # TRADED means the whole order filled.
+        filled = qty if status == "TRADED" and qty else traded
+        avg = float(data.get("avgtradedprice", 0) or 0) or float(data.get("tradedprice", 0) or 0)
+        return OrderResult(order_id, status, filled, avg,
+                           str(data.get("reasondescription") or data.get("remarks") or ""))
 
 
 @dataclass
@@ -82,6 +179,9 @@ class DhanBroker:
         self.client_id = client_id
         self.segment = exchange_segment
         self.product = product_type
+        self._token = access_token
+        self.stream: Optional[OrderUpdateStream] = None   # set by the engine in live mode
+        self.last_call_at = 0.0                           # monotonic time of the last HTTP call
         self._s = requests.Session()
         self._s.headers.update({
             "access-token": access_token.get_secret(), "client-id": client_id,
@@ -102,6 +202,7 @@ class DhanBroker:
         network failure — callers decide what that means (see place())."""
         if payload is not None:
             payload = dict(payload, dhanClientId=self.client_id)
+        self.last_call_at = time.monotonic()
         resp = self._s.request(method, _BASE + path, json=payload, timeout=timeout)
         try:
             body = resp.json() if resp.content else {}
@@ -237,17 +338,71 @@ class DhanBroker:
     async def funds_async(self):
         return await asyncio.to_thread(self.available_funds)
 
-    async def wait_for_fill(self, order_id: str, timeout: float = 6.0, poll: float = 0.25) -> OrderResult:
-        """Poll until the order is final or `timeout` passes. On timeout the
-        remainder is cancelled and whatever filled is returned — a market
-        order still working after several seconds should not be left live."""
+    def keep_warm(self) -> None:
+        """A cheap read that keeps the HTTPS connection to Dhan open. Measured:
+        a request on a NEW connection took 327 ms, on an open one 39 ms — the
+        ~290 ms handshake must never land on an order."""
+        try:
+            self._call("GET", "/fundlimit", timeout=5.0)
+        except requests.RequestException:
+            pass
+
+    async def keep_warm_async(self):
+        return await asyncio.to_thread(self.keep_warm)
+
+    async def wait_for_fill(self, order_id: str, timeout: float = 6.0, exact: bool = False) -> OrderResult:
+        """Wait until the order is final, then return its fill.
+
+        SPEED: the pushed order-update (if the stream is connected) answers the
+        moment Dhan knows; REST is asked every 100 ms as well, in case a push
+        is missed. Before, REST was the only source, asked every 250 ms — so a
+        first check that caught the order in TRANSIT cost another 250 ms.
+        exact=True re-reads the final fill over REST before returning (used for
+        exits, whose price is booked straight into the trade record).
+
+        On timeout the remainder is cancelled and whatever filled is returned —
+        a market order still working after several seconds must not be left live."""
         deadline = time.monotonic() + timeout
-        res = OrderResult(order_id, "PENDING")
-        while time.monotonic() < deadline:
-            res = await self.status_async(order_id)
-            if res.status in _FINAL:
-                return res
-            await asyncio.sleep(poll)
+        live = bool(self.stream and self.stream.connected)
+        next_poll = time.monotonic() + (0.1 if live else 0.0)
+        poll_task: Optional[asyncio.Task] = None
+        try:
+            while time.monotonic() < deadline:
+                pushed = self.stream.latest(order_id) if self.stream else None
+                if pushed and str(pushed.get("status", "")).upper() in _FINAL:
+                    res = OrderUpdateStream.to_result(order_id, pushed)
+                    if exact or res.avg_price <= 0:
+                        rest = await self.status_async(order_id)
+                        if rest.status in _FINAL:
+                            return rest
+                    return res
+                if poll_task is None and time.monotonic() >= next_poll:
+                    poll_task = asyncio.ensure_future(self.status_async(order_id))
+                if poll_task is not None and poll_task.done():
+                    res = poll_task.result()
+                    poll_task = None
+                    if res.status in _FINAL:
+                        return res
+                    next_poll = time.monotonic() + 0.1
+                    continue
+                # Race: a push, the in-flight REST check, or the next poll time —
+                # whichever comes first. A push is never kept waiting behind REST.
+                wait = max(0.0, min(next_poll if poll_task is None else deadline, deadline) - time.monotonic())
+                waiters = []
+                if self.stream and self.stream.connected:
+                    waiters.append(asyncio.ensure_future(self.stream.wait_change(order_id, wait)))
+                if poll_task is not None:
+                    waiters.append(poll_task)
+                if waiters:
+                    await asyncio.wait(waiters, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+                    for w in waiters:
+                        if w is not poll_task and not w.done():
+                            w.cancel()
+                else:
+                    await asyncio.sleep(wait)
+        finally:
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
         await self.cancel_async(order_id)
         final = await self.status_async(order_id)
         final.status = final.status if final.status in _FINAL else "TIMEOUT"
