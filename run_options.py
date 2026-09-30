@@ -146,7 +146,8 @@ def _print_banner(config) -> None:
         else ("║" + "  *** LIVE TRADING - REAL ORDERS, REAL MONEY ***".ljust(76) + "║"),
         "╚" + "═" * 76 + "╝",
         _section("SESSION"),
-        f"│  {'capital':<18} Rs {config.paper_capital:,.0f}",
+        (f"│  {'capital':<18} Rs {config.paper_capital:,.0f}" if config.paper_trading
+         else f"│  {'capital':<18} Dhan available funds (never more than Rs {config.paper_capital:,.0f})"),
         f"│  {'timeframe':<18} {tf}m Heikin-Ashi candles",
         f"│  {'lot size':<18} {config.lot_size} (config default — live scrip-master value wins)",
         f"│  {'max lots/trade':<18} "
@@ -157,10 +158,13 @@ def _print_banner(config) -> None:
         f"│  {'entry':<18} HA GREEN -> RED -> RED breakout, sell-to-open only",
         f"│  {'gates':<18} pattern only — no RSI, no volume, no ratchet",
         f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open",
-        f"│  {'sequencing':<18} watch both legs; first to fire locks out the other",
+        f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
         f"│  {'entries':<18} from {config.entry_start} IST, none after 15:00",
         f"│  {'fills':<18} market price at signal (raw close); stop fills at the tick that hits it",
         f"│  {'exit':<18} stop = HA high 2 candles back (trails each close) + 15:00 square-off",
+        (f"│  {'profit lock':<18} {config.profit_lock_start_pts:g} pts below entry, then every "
+         f"{config.profit_lock_step_pts:g} pts (one step behind); buy back when it comes back"
+         if config.profit_lock else f"│  {'profit lock':<18} off"),
         f"│  {'candle close':<18} exactly at the boundary"
         + (f" + {config.candle_close_grace_ms} ms grace" if config.candle_close_grace_ms else " (hh:mm:00.000), exchange trade time"),
         f"│  {'expiry':<18} nearest weekly" + (" — rolls to next week on expiry day" if config.roll_on_expiry_day else " (0 DTE on expiry day)"),
@@ -268,7 +272,8 @@ def _print_session_summary(engine, config) -> None:
         logger.info(f"│  {'gross P&L':<18} Rs {gross:+,.2f}")
         logger.info(f"│  {'charges':<18} Rs {charges:,.2f}")
         logger.info(f"│  {'NET P&L':<18} Rs {net:+,.2f}")
-        logger.info(f"│  {'closing balance':<18} Rs {engine.balance:,.2f}")
+        if engine.broker is None:
+            logger.info(f"│  {'closing balance':<18} Rs {engine.balance:,.2f}  (paper)")
     else:
         logger.info(f"│  {'trades closed':<18} none today")
 

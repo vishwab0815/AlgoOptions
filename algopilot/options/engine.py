@@ -10,15 +10,16 @@ Real-time pipeline:
         -> paper fill (sell to open) -> ledger
         -> every tick on an open leg: Heikin-Ashi trailing stop, EOD square-off
 
-Entries are PURE pattern — no RSI gate, no volume gate, no profit ratchet.
-The only two things that ever close a position are the trailing stop and
-the 15:00 IST EOD square-off.
+Entries are PURE pattern — no RSI gate, no volume gate. Three things close a
+position: the Heikin-Ashi trailing stop, the profit lock (10 points below the
+entry, then one 3-point step behind the best — see _track_profit), and the
+15:00 IST EOD square-off. Whichever is reached first.
 
-Sequencing: at the start of the day (or after the previous trade closes),
-BOTH legs are watched — whichever breaks its pattern FIRST fires. The moment
-that happens, the OTHER leg is locked out (only one position open at a time,
-per OPTIONS_MAX_CONCURRENT=1) until this one closes, at which point watching
-flips to specifically the other leg.
+Sequencing: BOTH legs are watched all day — whichever breaks its pattern
+FIRST fires, and the other leg can't open while that position is open (one
+position at a time, OPTIONS_MAX_CONCURRENT=1). Once it closes, EITHER leg may
+trade next; the leg that just closed only on a fresh pattern (its GREEN must
+close after the exit).
 
 A slower maintenance loop (poll_interval_secs) handles spot polling for band
 resolution, a safety-net candle flush, and a heartbeat log — see
@@ -31,15 +32,15 @@ through the same Heikin-Ashi/pattern logic (see _backfill_leg()) — no live
 entries fire from this replay, it only seeds setup_stage/target_level so the
 first LIVE candle continues the day's real story instead of starting fresh.
 
-Crash/restart recovery: band, expiry, active side, and any open position are
+Crash/restart recovery: band, expiry, last exit per side, and any open position are
 persisted to the ledger on every state change (see _save_state()) and
 restored on the next startup (_restore_state()) — a restart while short a
 leg resumes managing that exact position rather than losing track of it.
 Guarded by trading day, so a fresh day never resurrects yesterday's state.
 
-This module places NO real order, anywhere — every fill here is simulated at
-the live-quoted premium. See config.py for the hard refusal to start
-otherwise.
+Paper mode (OPTIONS_PAPER_TRADING=true) simulates every fill at the
+live-quoted premium. Live mode (false) sends real orders through
+broker.DhanBroker — every live branch is gated on `self.broker is not None`.
 """
 from __future__ import annotations
 
@@ -64,7 +65,7 @@ from .dhan_client import OptionsDhanClient
 from .ledger import OptionsLedger
 from .broker import DhanBroker, OrderResult, OrderUpdateStream, new_tag, to_tick
 from .charges import ChargeRates, round_trip_charges
-from .position import OpenPosition, trailing_exit_level
+from .position import OpenPosition, profit_lock_level, trailing_exit_level
 from .websocket import OptionsWebSocketManager
 
 logger = logging.getLogger(__name__)
@@ -107,11 +108,13 @@ _WARM_IF_IDLE_SECS = 20.0
 # already enough — the seed's influence halves with every candle.
 _HA_SEED_LOOKBACK_DAYS = 5
 
-# Completing the candle that was half-formed at start (see
-# _complete_partial_candle): how long to wait for DhanHQ to publish the full
-# candle after it closes, and how often to ask.
+# Fetching DhanHQ's bar for a candle that just closed (see _finalize_candle).
+# The half-formed candle at start MUST be completed, so it waits longer.
+# Asking every 0.5 s keeps two legs within Dhan's 5 requests/s data limit.
 _PARTIAL_FETCH_MAX_SECS = 5.0
-_PARTIAL_FETCH_POLL_SECS = 0.25
+_BAR_FETCH_POLL_SECS = 0.5
+# How long after using a bar to fetch it again and check Dhan didn't revise it.
+_BAR_RECHECK_SECS = 20.0
 
 # Kill switch: create this file (any content) and the engine squares off
 # every open position and stops. It refuses to START while the file exists.
@@ -171,11 +174,16 @@ class LegState:
     # The candle that was already half-formed when this leg started receiving
     # ticks (engine start, restart, or a strike change). The live feed only
     # sees its second half, so at its close the complete bar is fetched from
-    # DhanHQ before it's evaluated — see _complete_partial_candle().
+    # DhanHQ before it's evaluated — see _finalize_candle().
     partial_bucket: Optional[datetime] = None
     # Set when that fetch failed: the candle still feeds the pattern, but a
     # signal on it is not traded (its prices couldn't be verified).
     unverified_bucket: Optional[datetime] = None
+    # When the latest GREEN (the pattern's starter candle) closed. The
+    # pattern is GREEN -> RED -> RED, so at a signal this is when the setup
+    # began — used to tell a fresh setup from one formed during the previous
+    # trade on this side (see _entry_skip_reason).
+    starter_end: Optional[datetime] = None
 
 
 class OptionsEngine:
@@ -197,11 +205,13 @@ class OptionsEngine:
         self.put_strike: Optional[float] = None
         self.call_strike: Optional[float] = None
         self.expiry: Optional[str] = None
-        # "ANY" = watch both legs, first pattern to fire wins. Pinned to one
-        # specific side the instant a position opens (see _enter), and
-        # flipped to the OTHER side the instant it closes (see _exit) — it
-        # only ever returns to "ANY" on a fresh trading day.
-        self.active_side: str = "ANY"
+        # One position at a time; after it closes EITHER side may trade next.
+        # (Alternation — "after a CE trade only PE" — was removed on 30-Sep: it
+        # skipped the 11:20 CE signal that day.) A side that just closed needs
+        # a FRESH pattern: its GREEN must close after that exit, so the engine
+        # can't jump straight back in on a setup formed during the trade.
+        # Rebuilt from the ledger on restart (_restore_realized_pnl).
+        self._last_exit_at: Dict[str, datetime] = {}
         self.legs: Dict[str, LegState] = {side: self._new_leg(side) for side in _LEGS}
 
         self._trading_day: date = _today_ist()
@@ -275,11 +285,18 @@ class OptionsEngine:
 
     async def run(self) -> None:
         self._running = True
-        logger.info(
-            "OptionsEngine starting | paper capital=Rs %.0f | max lots/trade=%d | "
-            "lot size=%d (config default) | trailing stop only, no RSI/ratchet",
-            self.balance, self.config.max_lots_per_trade, self.config.lot_size,
-        )
+        if self.broker is not None:
+            logger.info(
+                "OptionsEngine starting | LIVE | max lots/trade=%d | sized on Dhan's available funds | "
+                "lot size=%d (config default) | trailing stop only, no RSI/ratchet",
+                min(self.config.max_lots_per_trade, self.config.live_max_lots), self.config.lot_size,
+            )
+        else:
+            logger.info(
+                "OptionsEngine starting | PAPER | capital=Rs %.0f | max lots/trade=%d | "
+                "lot size=%d (config default) | trailing stop only, no RSI/ratchet",
+                self.balance, self.config.max_lots_per_trade, self.config.lot_size,
+            )
         self.ledger.log_event("ENGINE_START", details=f"paper_capital={self.balance}")
 
         had_prior_state = self._restore_state()
@@ -323,12 +340,25 @@ class OptionsEngine:
         finally:
             if self.ws_manager is not None:
                 self.ws_manager.stop()
+            if self.broker is not None and self.broker.stream is not None:
+                await self.broker.stream.stop()
+            await self._cancel_background_tasks()
             self.client.close()
             if self.broker is not None:
-                if self.broker.stream is not None:
-                    await self.broker.stream.stop()
                 self.broker.close()
             self.ledger.close()
+
+    async def _cancel_background_tasks(self, timeout: float = 3.0) -> None:
+        """End every task this engine spawned before shutting down. Left to
+        asyncio.run() they were cancelled only after the summary printed, and
+        on 30-Sep the order stream's close sat there 10 s until a second Ctrl+C
+        killed it mid-close ("Task was destroyed but it is pending!").
+        State is saved on every change, so a restart resumes any open trade."""
+        pending = [t for t in self._background_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
 
     async def _candle_clock(self) -> None:
         """Close every leg's candle at EXACTLY the timeframe boundary.
@@ -367,11 +397,14 @@ class OptionsEngine:
         mkt = get_market_status(now=boundary)
         if (not mkt.is_trading_allowed and not mkt.eod_squareoff_due) or self.client.auth_failed:
             return
-        for side in _LEGS:
-            leg = self.legs[side]
-            if leg.security_id:
-                for candle in leg.candle_builder.flush_completed(boundary):
-                    await self._on_candle_close(side, leg, candle, mkt.eod_squareoff_due)
+        closed = [(side, self.legs[side], candle) for side in _LEGS if self.legs[side].security_id
+                  for candle in self.legs[side].candle_builder.flush_completed(boundary)]
+        # Both legs' DhanHQ bars are fetched AT THE SAME TIME, then evaluated
+        # in the usual order (CE, then PE) — never one leg waiting on the other's fetch.
+        final = await asyncio.gather(*(self._finalize_candle(side, leg, c) for side, leg, c in closed))
+        for (side, leg, _), candle in zip(closed, final):
+            if candle is not None:
+                await self._on_candle_close(side, leg, candle, mkt.eod_squareoff_due, finalized=True)
 
     def _restore_realized_pnl(self) -> None:
         """BUG FIXED: balance and realized P&L lived only in memory, so any
@@ -383,10 +416,30 @@ class OptionsEngine:
             return
         self.realized_pnl = round(sum(t["pnl"] for t in trades), 2)
         self.balance = self.config.paper_capital + self.realized_pnl
+        for t in trades:
+            try:
+                self._note_exit(t["leg"], datetime.fromisoformat(t["exit_time"]))
+            except (TypeError, ValueError):
+                pass
         logger.info(
             "Resumed today's result from the ledger: %d closed trade(s), net Rs %+.2f, balance Rs %.2f",
             len(trades), self.realized_pnl, self.balance,
         )
+
+    def _note_exit(self, side: str, at: datetime) -> None:
+        """Remember when `side` last closed a trade (latest wins)."""
+        if side not in _LEGS:
+            return
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        prev = self._last_exit_at.get(side)
+        if prev is None or at > prev:
+            self._last_exit_at[side] = at
+
+    def _last_exits_text(self) -> str:
+        if not self._last_exit_at:
+            return "none"
+        return ", ".join(f"{s} {ts.astimezone(_IST):%H:%M:%S}" for s, ts in sorted(self._last_exit_at.items()))
 
     def stop(self) -> None:
         self._running = False
@@ -586,6 +639,8 @@ class OptionsEngine:
 
             c_start = datetime.fromtimestamp(c["timestamp"], tz=timezone.utc).astimezone(_IST)
             c_end = c_start + timedelta(seconds=interval_secs)
+            if color == "GREEN":
+                leg.starter_end = c_end
             window = f"{c_start:%H:%M}-{c_end:%H:%M}"
             self._log_pattern_stage(
                 side, window, row, color, decision, old_stage, old_target, new_stage, new_level,
@@ -752,7 +807,7 @@ class OptionsEngine:
             self._trading_day = today
             self.put_strike = self.call_strike = None
             self.expiry = None
-            self.active_side = "ANY"
+            self._last_exit_at = {}
             self.legs = {side: self._new_leg(side) for side in _LEGS}
             self._save_state()
 
@@ -769,12 +824,14 @@ class OptionsEngine:
                 "trade_id": p.trade_id, "entry_price": p.entry_price, "qty": p.qty,
                 "entry_time": p.entry_time.isoformat(), "entry_order_id": p.entry_order_id,
                 "cover_level": p.cover_level,
+                "best_price": p.best_price, "lock_price": p.lock_price,
                 "stop_order_id": p.stop_order_id, "stop_trigger_sent": p.stop_trigger_sent,
                 "strike": leg.strike, "security_id": leg.security_id, "lot_size": leg.lot_size,
             }
         return {
             "put_strike": self.put_strike, "call_strike": self.call_strike,
-            "expiry": self.expiry, "active_side": self.active_side,
+            "expiry": self.expiry,
+            "last_exit_at": {s: ts.isoformat() for s, ts in self._last_exit_at.items()},
             "positions": positions,
         }
 
@@ -791,7 +848,11 @@ class OptionsEngine:
         self.put_strike = state.get("put_strike")
         self.call_strike = state.get("call_strike")
         self.expiry = state.get("expiry")
-        self.active_side = state.get("active_side", "ANY")
+        for s, iso in (state.get("last_exit_at") or {}).items():
+            try:
+                self._note_exit(s, datetime.fromisoformat(iso))
+            except (TypeError, ValueError):
+                pass
         if self.put_strike is None:
             return False
 
@@ -815,18 +876,21 @@ class OptionsEngine:
                 entry_time=datetime.fromisoformat(pdata["entry_time"]),
                 entry_order_id=pdata.get("entry_order_id", ""),
                 cover_level=pdata.get("cover_level", 0.0),
+                best_price=pdata.get("best_price", 0.0) or 0.0,
+                lock_price=pdata.get("lock_price", 0.0) or 0.0,
                 stop_order_id=pdata.get("stop_order_id", "") or "",
                 stop_trigger_sent=pdata.get("stop_trigger_sent", 0.0) or 0.0,
             )
             restored_position = True
             logger.info(
-                "[%s] restored an OPEN position from a previous run: entry=%.2f qty=%d cover=%.2f",
+                "[%s] restored an OPEN position from a previous run: entry=%.2f qty=%d cover=%.2f%s",
                 side, leg.position.entry_price, leg.position.qty, leg.position.cover_level,
+                f" profit lock={leg.position.lock_price:.2f}" if leg.position.lock_price else "",
             )
 
         logger.info(
-            "Restored state from an earlier run today: PUT %.0f / CALL %.0f | expiry=%s | active_side=%s%s",
-            self.put_strike, self.call_strike, self.expiry, self.active_side,
+            "Restored state from an earlier run today: PUT %.0f / CALL %.0f | expiry=%s | last exit %s%s",
+            self.put_strike, self.call_strike, self.expiry, self._last_exits_text(),
             " | open position restored" if restored_position else " | no open position",
         )
         return True
@@ -992,20 +1056,21 @@ class OptionsEngine:
             signal=decision.signal or "NONE",
         )
 
-    async def _on_candle_close(self, side: str, leg: LegState, candle: Candle, squareoff_due: bool) -> None:
+    async def _on_candle_close(self, side: str, leg: LegState, candle: Candle, squareoff_due: bool,
+                               finalized: bool = False) -> None:
+        if not finalized:
+            candle = await self._finalize_candle(side, leg, candle)
+            if candle is None:
+                return
         if leg is not self.legs.get(side):
             return          # a candle of strikes the engine has already moved off
-        if leg.partial_bucket is not None and candle.start_ts == leg.partial_bucket:
-            leg.partial_bucket = None
-            candle = await self._complete_partial_candle(side, leg, candle)
-            if leg is not self.legs.get(side):
-                # Strikes changed while the full candle was being fetched: the
-                # old strike's signal must not be traded after the engine left it.
-                logger.info("[%-2s] strikes changed during the candle fetch — old strike's candle dropped.", side)
-                return
         ha_row = leg.ha_engine.append_candle(candle.as_dict())
         candle_index = len(leg.ha_engine.df) - 1
 
+        if leg.position is not None and candle.start_ts >= leg.position.entry_time:
+            # The feed sends snapshots, so a brief touch of a profit mark can be
+            # missed between them; the bar's low (DhanHQ's, when available) has it.
+            self._track_profit(side, leg, float(candle.low))
         if leg.position is not None:
             trailing = trailing_exit_level(leg.ha_engine.df, candle_index)
             if trailing is not None:
@@ -1025,6 +1090,8 @@ class OptionsEngine:
         )
         leg.target_level = new_level
         leg.setup_stage = new_stage
+        if is_bullish:
+            leg.starter_end = candle.end_ts
 
         # Always logged, both legs, every close — the locked-out side's
         # pattern keeps tracking silently underneath regardless (so it's
@@ -1069,42 +1136,109 @@ class OptionsEngine:
             at_time=candle.end_ts, signal_price=float(ha_row["ha_close"]), decided=after,
         )
 
-    async def _complete_partial_candle(self, side: str, leg: LegState, candle: Candle) -> Candle:
-        """BUG FIXED: the candle already half-formed when the engine started was
-        built only from ticks received AFTER start — start at 10:02 and the
-        10:00-10:05 candle missed 10:00-10:02, so its open/high/low (and so its
-        HA colour, and any signal on it) could be wrong. At its close, fetch
-        the complete bar from DhanHQ and use that instead."""
+    async def _fetch_bar(self, leg: LegState, candle: Candle, max_wait: float) -> Optional[dict]:
+        """DhanHQ's own bar for `candle`'s bucket, asked for until it appears
+        or `max_wait` seconds pass (None then). Never blocks longer than that,
+        even if a request hangs."""
         tf = self.config.candle_timeframe_secs
         # Ask from one bar EARLIER: a request that starts exactly on a bar's
         # start time comes back without that bar's first prints (see _backfill_leg).
         frm = (candle.start_ts - timedelta(seconds=tf)).astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S")
         to = (candle.end_ts + timedelta(seconds=tf)).astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S")
         want = int(candle.start_ts.timestamp())
-        deadline = time.monotonic() + _PARTIAL_FETCH_MAX_SECS
-        bar = None
+        deadline = time.monotonic() + max_wait
         while True:
-            rows = await self.client.get_intraday_candles_async(
-                leg.security_id, self.config.option_exchange_segment, "OPTIDX", max(1, tf // 60), frm, to)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                rows = await asyncio.wait_for(self.client.get_intraday_candles_async(
+                    leg.security_id, self.config.option_exchange_segment, "OPTIDX", max(1, tf // 60), frm, to),
+                    timeout=left)
+            except asyncio.TimeoutError:
+                return None
             bar = next((r for r in (rows or []) if int(r["timestamp"]) == want), None)
-            if bar is not None or time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(_PARTIAL_FETCH_POLL_SECS)
+            if bar is not None:
+                return bar
+            if deadline - time.monotonic() <= _BAR_FETCH_POLL_SECS:
+                return None
+            await asyncio.sleep(_BAR_FETCH_POLL_SECS)
+
+    @staticmethod
+    def _with_bar(candle: Candle, bar: dict) -> Candle:
+        return dc_replace(candle, open=float(bar["open"]), high=float(bar["high"]), low=float(bar["low"]),
+                          close=float(bar["close"]), volume=float(bar.get("volume", candle.volume) or 0.0),
+                          synthetic=False)
+
+    async def _finalize_candle(self, side: str, leg: LegState, candle: Candle) -> Optional[Candle]:
+        """The candle to evaluate: DhanHQ's own bar for it when available, else
+        the live-feed candle. None = drop it (strikes changed meanwhile).
+
+        1. The candle half-formed when this leg started (engine start, restart,
+           strike change) was only partly seen — start at 10:02 and 10:00-10:02
+           is missing. It is ALWAYS completed from DhanHQ; if that fails, a
+           signal on it is not traded.
+        2. Every other candle (OPTIONS_OFFICIAL_CANDLES=true): the live feed
+           sends snapshots, not every trade, so its highs/lows can differ from
+           the exchange's — and the pattern level is an HA low. DhanHQ's bar is
+           what the chart shows; if it hasn't appeared within
+           OPTIONS_OFFICIAL_CANDLE_WAIT_MS, the live-feed candle is used."""
+        if leg is not self.legs.get(side):
+            return None
+        partial = leg.partial_bucket is not None and candle.start_ts == leg.partial_bucket
+        if partial:
+            leg.partial_bucket = None
+        elif not self.config.official_candles:
+            return candle
+        max_wait = _PARTIAL_FETCH_MAX_SECS if partial else self.config.official_candle_wait_ms / 1000.0
+        t0 = time.monotonic()
+        bar = await self._fetch_bar(leg, candle, max_wait)
+        took_ms = (time.monotonic() - t0) * 1000.0
+        if leg is not self.legs.get(side):
+            # Strikes changed while the bar was being fetched: the old strike's
+            # signal must not be traded after the engine left it.
+            logger.info("[%-2s] strikes changed during the candle fetch — old strike's candle dropped.", side)
+            return None
         window = f"{candle.start_ts.astimezone(_IST):%H:%M}-{candle.end_ts.astimezone(_IST):%H:%M}"
         if bar is None:
-            leg.unverified_bucket = candle.start_ts
-            logger.warning(
-                "[%-2s] %s was only partly seen (engine started mid-candle) and DhanHQ hadn't published the "
-                "full candle within %.0fs — it still updates the pattern, but a signal on it will NOT be traded.",
-                side, window, _PARTIAL_FETCH_MAX_SECS)
+            if partial:
+                leg.unverified_bucket = candle.start_ts
+                logger.warning(
+                    "[%-2s] %s was only partly seen (engine started mid-candle) and DhanHQ hadn't published the "
+                    "full candle within %.0fs — it still updates the pattern, but a signal on it will NOT be traded.",
+                    side, window, max_wait)
+            else:
+                logger.warning("[%-2s] %s: DhanHQ's bar not available within %.0f ms — using the live-feed candle.",
+                               side, window, max_wait * 1000.0)
             return candle
-        logger.info(
-            "[%-2s] %s completed from DhanHQ (engine started mid-candle): live feed saw O=%.2f H=%.2f L=%.2f "
-            "C=%.2f, full candle O=%.2f H=%.2f L=%.2f C=%.2f",
-            side, window, candle.open, candle.high, candle.low, candle.close,
-            bar["open"], bar["high"], bar["low"], bar["close"])
-        return dc_replace(candle, open=float(bar["open"]), high=float(bar["high"]), low=float(bar["low"]),
-                          close=float(bar["close"]), volume=float(bar.get("volume", candle.volume) or 0.0))
+        if partial:
+            logger.info(
+                "[%-2s] %s completed from DhanHQ (engine started mid-candle): live feed saw O=%.2f H=%.2f L=%.2f "
+                "C=%.2f, full candle O=%.2f H=%.2f L=%.2f C=%.2f",
+                side, window, candle.open, candle.high, candle.low, candle.close,
+                bar["open"], bar["high"], bar["low"], bar["close"])
+        else:
+            logger.debug("[%-2s] %s DhanHQ bar in %.0f ms: O=%.2f H=%.2f L=%.2f C=%.2f (live feed O=%.2f H=%.2f "
+                         "L=%.2f C=%.2f)", side, window, took_ms, bar["open"], bar["high"], bar["low"], bar["close"],
+                         candle.open, candle.high, candle.low, candle.close)
+        used = self._with_bar(candle, bar)
+        self._spawn(self._recheck_bar(side, leg, used))
+        return used
+
+    async def _recheck_bar(self, side: str, leg: LegState, used: Candle) -> None:
+        """Fetch the bar again a little later: if DhanHQ revised it after the
+        engine acted on it, say so (it was final at first sight in every check
+        so far — this keeps proving that on the VM)."""
+        await asyncio.sleep(_BAR_RECHECK_SECS)
+        bar = await self._fetch_bar(leg, used, 5.0)
+        if bar is None:
+            return
+        diff = [f"{k[0].upper()} {getattr(used, k):.2f}->{float(bar[k]):.2f}"
+                for k in ("open", "high", "low", "close") if abs(getattr(used, k) - float(bar[k])) > 1e-6]
+        if diff:
+            window = f"{used.start_ts.astimezone(_IST):%H:%M}-{used.end_ts.astimezone(_IST):%H:%M}"
+            logger.warning("[%-2s] %s: DhanHQ revised this bar after it was used (%s).", side, window, ", ".join(diff))
+            self.ledger.log_event("BAR_REVISED", symbol=side, details=f"candle={window} {' '.join(diff)}")
 
     def _entry_skip_reason(
         self, side: str, leg: LegState, candle: Candle, squareoff_due: bool,
@@ -1126,8 +1260,10 @@ class OptionsEngine:
         other_open = [s for s in _LEGS if s != side and self.legs[s].position is not None]
         if other_open:
             return f"{other_open[0]} position still open (one trade at a time)"
-        if self.active_side not in ("ANY", side):
-            return f"alternation - the next trade must be {self.active_side}"
+        last_exit = self._last_exit_at.get(side)
+        if last_exit is not None and (leg.starter_end is None or leg.starter_end <= last_exit):
+            return (f"not a fresh pattern - its GREEN closed before this side's last trade was covered "
+                    f"({last_exit.astimezone(_IST):%H:%M:%S}); needs a new GREEN -> RED -> RED")
         if squareoff_due:
             return "after 15:00 - no new entries"
         close_hhmm = candle.end_ts.astimezone(_IST).strftime("%H:%M")
@@ -1212,9 +1348,6 @@ class OptionsEngine:
             entry_order_id=entry_order_id, cover_level=initial_cover,
             entry_time=at_time or datetime.now(timezone.utc),
         )
-        # Pin watching to this side — the other leg is locked out until this
-        # position closes (see _exit, which flips it to the opposite side).
-        self.active_side = side
         # The ENTRY event and the state holding the new position commit as ONE
         # transaction — never one without the other.
         self.ledger.record_entry(
@@ -1333,13 +1466,22 @@ class OptionsEngine:
             # market; _poll_live_stops / the tick check resolve that.
             logger.warning("[%-2s] could not move the exchange stop to %.2f: %s", side, trigger, msg)
 
-    def _check_exits_live(self, side: str, leg: LegState, premium: float, squareoff_due: bool) -> None:
+    def _check_exits_live(self, side: str, leg: LegState, premium: float, squareoff_due: bool,
+                          locked: bool = False) -> None:
         pos = leg.position
         if pos is None or pos.closing:
             return
         if squareoff_due:
             pos.closing = True
             self._spawn(self._live_close(side, leg, "EOD_SQUAREOFF"))
+            return
+        if locked and self._lock_is_tighter(pos):
+            # The profit lock lives in the engine (the exchange stop order stays
+            # the Heikin-Ashi stop): buy back now. _live_close cancels the
+            # exchange stop first, so the account can never be bought twice.
+            logger.info("[%-2s] profit lock %.2f reached at %.2f — buying back.", side, pos.lock_price, premium)
+            pos.closing = True
+            self._spawn(self._live_close(side, leg, "PROFIT_LOCK"))
             return
         if not pos.is_cover_level_triggered(premium):
             return
@@ -1588,13 +1730,21 @@ class OptionsEngine:
         pos = leg.position
         if pos is None:
             return
+        # Checked against the lock set by EARLIER prices, then this price
+        # updates it — so the tick that first touches a mark never exits on
+        # itself; the exit is when price COMES BACK to the lock.
+        locked = pos.lock_price > 0 and premium >= pos.lock_price - 1e-9
+        self._track_profit(side, leg, premium)
 
         if self.broker is not None:
-            self._check_exits_live(side, leg, premium, squareoff_due)
+            self._check_exits_live(side, leg, premium, squareoff_due, locked)
             return
 
         if squareoff_due:
             self._exit(side, leg, premium, "EOD_SQUAREOFF", at_time=at_time)
+            return
+        if locked and self._lock_is_tighter(pos):
+            self._exit(side, leg, premium, "PROFIT_LOCK", at_time=at_time)
             return
 
         # The stop LEVEL is Heikin-Ashi (see position.trailing_exit_level);
@@ -1606,6 +1756,31 @@ class OptionsEngine:
         if pos.is_cover_level_triggered(premium):
             self._exit(side, leg, max(premium, pos.cover_level), "TRAILING_STOP", at_time=at_time)
             return
+
+    @staticmethod
+    def _lock_is_tighter(pos: OpenPosition) -> bool:
+        """Price rising back hits the LOWER of the two exit levels first. When
+        the Heikin-Ashi stop is lower, it's the one that closes the trade."""
+        return pos.cover_level <= 0 or pos.lock_price <= pos.cover_level + 1e-9
+
+    def _track_profit(self, side: str, leg: LegState, price: float) -> None:
+        """Follow the lowest premium since entry and move the profit lock."""
+        pos = leg.position
+        if pos is None or not self.config.profit_lock or price <= 0:
+            return
+        if pos.best_price > 0 and price >= pos.best_price:
+            return
+        pos.best_price = price
+        lock = profit_lock_level(pos.entry_price, price, self.config.profit_lock_start_pts,
+                                 self.config.profit_lock_step_pts)
+        if lock is None or (pos.lock_price > 0 and lock >= pos.lock_price - 1e-9):
+            return
+        pos.lock_price = lock
+        logger.info("[%-2s] profit %.2f pts (premium %.2f) — locked %.2f pts: buy back if it comes back to %.2f",
+                    side, pos.entry_price - price, price, pos.entry_price - lock, lock)
+        self.ledger.log_event("PROFIT_LOCK_SET", symbol=side,
+                              details=f"entry={pos.entry_price:.2f} best={price:.2f} lock={lock:.2f}")
+        self._save_state()
 
     def _exit(
         self, side: str, leg: LegState, exit_price: float, reason: str,
@@ -1654,9 +1829,10 @@ class OptionsEngine:
                                     f"net={net_pnl:.2f} order={exit_order_id}{charge_note}")
         logger.info(
             "[%-2s] COVER %7.0f | %7.2f -> %7.2f x%-4d | gross Rs %+9.2f  charges Rs %6.2f  "
-            "NET Rs %+9.2f | %-14s | bal Rs %11.2f",
+            "NET Rs %+9.2f | %-14s | %s",
             side, leg.strike or 0.0, pos.entry_price, exit_price, closed,
-            gross_pnl, charges, net_pnl, reason, self.balance,
+            gross_pnl, charges, net_pnl, reason,
+            f"day net Rs {self.realized_pnl:+.2f}" if self.broker is not None else f"bal Rs {self.balance:11.2f}",
         )
 
         if partial:
@@ -1664,9 +1840,8 @@ class OptionsEngine:
             logger.critical("[%-2s] PARTIAL close: %d still open — the engine keeps managing it.", side, pos.qty)
         else:
             leg.position = None
-            # Sequential single-side rule: the instant this closes, flip
-            # watching to specifically the other leg for the next fresh entry.
-            self.active_side = "PE" if side == "CE" else "CE"
+            # Either side may trade next; this side only on a fresh pattern.
+            self._note_exit(side, exit_time)
         # The trade row, its event and the state that no longer holds the
         # position commit as ONE transaction. Before, a crash between them left
         # the position "open" in saved state with the trade already booked.

@@ -26,13 +26,18 @@ orders**, recording everything in a local SQLite ledger.
    **level = its HA low**; `3/3` the very next candle — if price trades below
    the level, that's a signal. Otherwise the pattern is dead until a new GREEN.
 5. **Filters** (skipped signals are logged with the reason): one trade at a
-   time; after a trade the other leg must trade next; entries only 09:30–15:00;
+   time; after a trade either leg may trade next (the same leg only on a fresh
+   pattern — its GREEN must close after the exit); entries only 09:30–15:00;
    never on a gap-filled candle; daily loss limit; blocked contracts (live).
 6. **Entry** — sell 1 lot at market (sizing: capital / live margin per lot).
 7. **Stop** — while candle N trades, the stop is the **HA high of candle N−2**,
    moved at every candle close. Checked on every tick, with the option-chain
    price every 5 s as a backup.
-8. **Exit** — stop hit, or everything bought back at 15:00.
+8. **Profit lock** — sold at 123: once the premium touches 113 (10 points),
+   buy back if it comes back to 113; at 110 the lock stays 113; at 107 it moves
+   to 110; at 104 to 107 — every 3 points, one step behind the best. Watched on
+   every tick by the engine (the exchange stop order stays the HA stop).
+9. **Exit** — stop hit, profit lock hit, or everything bought back at 15:00.
 9. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
    (rates in `.env`, estimates — check a contract note).
 

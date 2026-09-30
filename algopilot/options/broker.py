@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -91,8 +92,10 @@ class OrderUpdateStream:
         delay = 1.0
         while not self._stop:
             try:
+                # close_timeout: at shutdown, don't wait the default 10 s for
+                # Dhan to answer the close handshake (30-Sep: Ctrl+C hung 10 s).
                 async with websockets.connect(_ORDER_UPDATE_WSS, ping_interval=20, ping_timeout=20,
-                                              open_timeout=10) as ws:
+                                              open_timeout=10, close_timeout=2) as ws:
                     self._ws = ws
                     await ws.send(json.dumps({"LoginReq": {"MsgCode": 42, "ClientId": self._client_id,
                                                            "Token": self._token.get_secret()},
@@ -115,9 +118,10 @@ class OrderUpdateStream:
 
     async def stop(self) -> None:
         self._stop = True
-        if self._ws is not None:
+        ws = self._ws
+        if ws is not None:
             try:
-                await self._ws.close()
+                await asyncio.wait_for(ws.close(), 2.5)
             except Exception:
                 pass
 
@@ -218,7 +222,10 @@ class DhanBroker:
             if code in (401, 403) or ec in ("DH-901", "DH-902"):
                 return (f"HTTP {code} {ec}: {msg} — token expired/invalid, or this account has no "
                         "Trading API access. Nothing will be placed until it is fixed.")
-            if ec == "DH-905" or "ip" in str(msg).lower() and "invalid" in str(msg).lower():
+            # DH-905 is Dhan's generic "bad input" code. Only the text says
+            # whether it's the IP ("DH-905: Invalid IP") or a request field
+            # (e.g. "Missing required fields, bad values for parameters etc.").
+            if re.search(r"\bIP\b", str(msg), re.IGNORECASE):
                 return (f"{ec}: {msg} — this machine's public IP is not whitelisted for Dhan's order "
                         "APIs. Register it: web.dhan.co -> DhanHQ Trading APIs -> Static IP.")
             return f"HTTP {code} {ec}: {msg}".strip()
@@ -251,7 +258,12 @@ class DhanBroker:
         return None, self._reason(code, body)
 
     def modify(self, order_id: str, order_type: str, qty: int, price: float, trigger: float) -> Tuple[bool, str]:
-        payload = {"orderId": str(order_id), "orderType": order_type, "legName": "",
+        # No "legName": Dhan accepts it only for Bracket/Cover orders, and only
+        # as ENTRY_LEG / TARGET_LEG / STOP_LOSS_LEG. The empty string sent
+        # before was rejected on every stop move (30-Sep: "DH-905: Missing
+        # required fields, bad values for parameters"), forcing a cancel +
+        # re-place each candle.
+        payload = {"orderId": str(order_id), "orderType": order_type,
                    "quantity": int(qty), "price": float(price), "disclosedQuantity": 0,
                    "triggerPrice": float(trigger), "validity": "DAY"}
         try:

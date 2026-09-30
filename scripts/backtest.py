@@ -23,6 +23,8 @@ _compare_sequencing.py, which between them:
   - (backtest_options.py) still simulated the removed profit ratchet.
 
 Known limits, stated rather than hidden:
+  - inside a bar the path is assumed O-L-H-C (rising bar) or O-H-L-C
+    (falling bar) — see _walk_bar;
   - the strike band is the day's OPENING band; intraday re-banding when spot
     crosses a hundred is not replayed;
   - inside one 5-minute bar the order of high and low is unknown, so a stop is
@@ -69,6 +71,29 @@ class _OfflineMarginClient:
         pass
 
 
+def _walk_bar(e, side, leg, c, at) -> None:
+    """Feed one bar to the engine as the ticks it most likely went through:
+    open, then low before high on a rising bar (O-L-H-C), high before low on
+    a falling one (O-H-L-C). On every rise a tick is added exactly at each
+    exit level passed (stop, profit lock), so an exit fills at its level —
+    or at the open when the bar gapped past it. The order of high and low
+    inside a 5-minute bar is a guess; that's the backtest's main limit."""
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    path = [o, l, h, cl] if cl >= o else [o, h, l, cl]
+    prev = None
+    for p in path:
+        pos = leg.position
+        if pos is None:
+            return
+        if prev is not None and p > prev:
+            for level in sorted(x for x in (pos.cover_level, pos.lock_price) if x > 0 and prev < x < p):
+                e._check_exits(side, leg, level, False, at_time=at)
+                if leg.position is None:
+                    return
+        e._check_exits(side, leg, p, False, at_time=at)
+        prev = p
+
+
 def _weekdays(start: date, end: date):
     d = start
     while d <= end:
@@ -95,7 +120,8 @@ def _pick_expiry(listed, day: date, roll_on_expiry_day: bool):
 def _new_engine(cfg, db_path: str) -> OptionsEngine:
     # ALWAYS paper, whatever .env says. With OPTIONS_PAPER_TRADING=false a
     # replay would otherwise place a REAL order at every historical signal.
-    engine = OptionsEngine(replace(cfg, db_path=db_path, paper_trading=True))
+    # official_candles=False: the replayed bars ARE DhanHQ's bars already.
+    engine = OptionsEngine(replace(cfg, db_path=db_path, paper_trading=True, official_candles=False))
     assert engine.broker is None, "backtest must never have a live broker"
     engine.client.close()
     engine.client = _OfflineMarginClient(cfg.fallback_margin_per_lot)
@@ -159,18 +185,17 @@ async def _replay_day(cfg, client, day: date, expiry: str, independent: bool, tm
         if pos is not None:
             if start_ist.strftime("%H:%M") >= "15:00":
                 e._check_exits(side, leg, c["open"], True, at_time=start_ist)      # first tick after 15:00
-            elif pos.cover_level > 0 and c["high"] >= pos.cover_level:
-                gap_fill = max(c["open"], pos.cover_level)                        # gapped through -> the open
-                e._check_exits(side, leg, gap_fill, False, at_time=start_ist)
+            else:
+                _walk_bar(e, side, leg, c, start_ist)
 
         candle = Candle(symbol=side, exchange_segment=2, security_id=leg.security_id,
                         start_ts=start, end_ts=start + tf, open=c["open"], high=c["high"],
                         low=c["low"], close=c["close"], volume=c.get("volume", 0.0))
         squareoff_at_close = (start + tf).astimezone(_IST).strftime("%H:%M") >= "15:00"
         if independent:
-            # After any exit above, so the engine's "other leg next" flip
-            # can't block this leg re-entering on the same candle.
-            e.active_side = "ANY"
+            # The 'my sheet' model: every signal on each leg, so the live
+            # engine's fresh-pattern-after-exit rule doesn't apply here.
+            e._last_exit_at.clear()
         await e._on_candle_close(side, leg, candle, squareoff_at_close)
 
     trades, skips = [], Counter()

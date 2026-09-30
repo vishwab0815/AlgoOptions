@@ -135,6 +135,22 @@ class OptionsConfig:
     # in the final milliseconds, still in flight on the network, is included
     # — at the cost of deciding that much later. 0 = decide at the boundary.
     candle_close_grace_ms: int = 0
+    # Decide each candle on DhanHQ's own 5-minute bar (what the chart shows)
+    # instead of the one built from live-feed ticks. The feed sends snapshots,
+    # not every trade, so it misses highs/lows (30-Sep, CE 10:30-10:35: feed
+    # low 116.75, exchange low 115.35). DhanHQ published each bar ~45 ms after
+    # the close on the VM; if it's later than the wait below, the live-feed
+    # candle is used for that close.
+    official_candles: bool = True
+    official_candle_wait_ms: int = 1500
+
+    # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged): once the
+    # premium is `start` points below the entry, buy back if it comes back to
+    # that level; every further `step` points down moves the lock one step
+    # behind (sold 123: touch 113 -> lock 113; 110 -> 113; 107 -> 110; ...).
+    profit_lock: bool = True
+    profit_lock_start_pts: float = 10.0
+    profit_lock_step_pts: float = 3.0
 
     # No new entries before this IST time (HH:MM). market_hours.py always
     # documented a post-open buffer; the engine never enforced it. Set to
@@ -166,6 +182,16 @@ class OptionsConfig:
     # conservative, with an additional 15s cool-off automatically applied
     # after any 429 (see dhan_client.py).
     chain_min_interval_secs: float = 5.0
+
+
+def _positive(raw: str, name: str) -> float:
+    try:
+        v = float(raw)
+    except ValueError:
+        raise OptionsConfigError(f"{name}={raw!r} is not a number.")
+    if v <= 0:
+        raise OptionsConfigError(f"{name} must be greater than 0 (got {raw}).")
+    return v
 
 
 def load_options_config() -> OptionsConfig:
@@ -252,6 +278,12 @@ def load_options_config() -> OptionsConfig:
         option_exchange_segment=os.getenv("OPTIONS_EXCHANGE_SEGMENT", "NSE_FNO").strip(),
         fallback_margin_per_lot=float(os.getenv("OPTIONS_FALLBACK_MARGIN_PER_LOT", "130000.0")),
         candle_close_grace_ms=max(0, int(os.getenv("OPTIONS_CANDLE_CLOSE_GRACE_MS", "0"))),
+        official_candles=os.getenv("OPTIONS_OFFICIAL_CANDLES", "true").strip().lower() == "true",
+        official_candle_wait_ms=max(0, int(os.getenv("OPTIONS_OFFICIAL_CANDLE_WAIT_MS", "1500"))),
+        profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
+        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "10"),
+                                        "OPTIONS_PROFIT_LOCK_START_POINTS"),
+        profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),
         entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:30")),
         roll_on_expiry_day=os.getenv("OPTIONS_ROLL_ON_EXPIRY_DAY", "false").strip().lower() == "true",
         apply_charges=os.getenv("OPTIONS_APPLY_CHARGES", "true").strip().lower() == "true",

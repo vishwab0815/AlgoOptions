@@ -312,7 +312,7 @@ class OptionsDhanClient:
                 return None
             if resp.status_code != 200:
                 logger.warning(
-                    "Options: intraday candle backfill HTTP %d for security %s — skipping backfill.",
+                    "Options: intraday candles HTTP %d for security %s — no DhanHQ bars this request.",
                     resp.status_code, security_id,
                 )
                 return None
