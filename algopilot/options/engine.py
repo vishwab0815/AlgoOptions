@@ -135,6 +135,11 @@ _FLAT_CONFIRM_SECS = 1.0
 # How long a stop-order cancel may take to be confirmed before a buy-back.
 _CANCEL_SETTLE_SECS = 3.0
 _ORDER_DONE = ("CANCELLED", "TRADED", "REJECTED", "EXPIRED")
+# Version-2 entry (entry_mode="break"): how often the parked sell's status is
+# also asked over REST (Dhan PUSHES fills; this is the fallback), and how long a
+# partly filled sell gets to complete before the rest is cancelled.
+_ARM_POLL_SECS = 0.5
+_PART_FILL_WAIT_SECS = 2.0
 
 # Refresh a leg's cached margin this long before its 15-minute cache expires.
 _MARGIN_REFRESH_SECS = 600.0
@@ -196,6 +201,30 @@ class LegState:
     # Start of the last candle evaluated on this leg: each candle is evaluated
     # at most once, whichever path closes it (see _finalize_candle).
     last_candle_start: Optional[datetime] = None
+
+
+@dataclass
+class ArmedEntry:
+    """Version-2 entry: the SELL waiting at candle 2's HA Low − offset while
+    candle 3 forms. Live it is a stop-limit order parked AT THE EXCHANGE (fills
+    the instant price gets there); paper/backtest fill on the first price at or
+    below it. Cancelled when candle 3 closes unfilled. See OptionsEngine._arm."""
+    side: str
+    leg: "LegState"
+    level: float             # candle 2's HA Low
+    trigger: float           # the sell price: level − offset, on the 0.05 tick
+    stop: float              # candle 2's HA High: the stop until candle 4 closes
+    window: str              # candle 3, "HH:MM-HH:MM" IST
+    armed_at: datetime       # candle 2's close
+    expires_at: datetime     # candle 3's close
+    lots: int
+    qty: int
+    per_lot_margin: float
+    margin_live: bool
+    order_id: str = ""
+    state: str = "ARMED"     # ARMED -> FILLED | EXPIRED | CANCELLED
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    kick: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class OptionsEngine:
@@ -262,6 +291,13 @@ class OptionsEngine:
         # and PE both signalled on the same candle, the second passed the
         # check while the first was still being filled, and both opened.
         self._entry_in_flight: Optional[str] = None
+        # Version 2: the one SELL waiting for candle 3 (never more than one —
+        # the account's margin covers one), candle-2 candidates collected at a
+        # boundary so CE and PE can be compared, and an armed order saved by a
+        # previous run (resolved at startup, see _recover_armed).
+        self._armed: Optional[ArmedEntry] = None
+        self._arm_candidates: Dict[str, tuple] = {}
+        self._armed_restore: Optional[dict] = None
 
         self._charge_rates = ChargeRates(
             brokerage_per_order=config.brokerage_per_order,
@@ -293,7 +329,7 @@ class OptionsEngine:
         legs, the fill was then attached to the discarded old leg, and the
         engine lost a real short: no trailing stop, no 15:00 buy-back, not in
         saved state (reproduced in a test before this fix)."""
-        return (self._entry_in_flight is not None
+        return (self._entry_in_flight is not None or self._armed is not None
                 or any(leg.position is not None for leg in self.legs.values()))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -357,6 +393,12 @@ class OptionsEngine:
         finally:
             if self.ws_manager is not None:
                 self.ws_manager.stop()
+            # A SELL left parked at the exchange could open a position while
+            # nothing is watching it — cancel it before anything else closes.
+            try:
+                await self._cancel_armed("engine stopping")
+            except Exception:
+                logger.exception("Could not cancel the waiting sell order at shutdown — check the Dhan app.")
             if self.broker is not None and self.broker.stream is not None:
                 await self.broker.stream.stop()
             await self._cancel_background_tasks()
@@ -432,10 +474,17 @@ class OptionsEngine:
                   for candle in self.legs[side].candle_builder.flush_completed(boundary)]
         # Both legs' DhanHQ bars are fetched AT THE SAME TIME, then evaluated
         # in the usual order (CE, then PE) — never one leg waiting on the other's fetch.
-        final = await asyncio.gather(*(self._finalize_candle(side, leg, c) for side, leg, c in closed))
+        # Candle 3's close also ends a waiting sell: cancelled (or, if it filled
+        # meanwhile, booked) while the bars are being fetched.
+        results = await asyncio.gather(
+            self._expire_armed(boundary),
+            *(self._finalize_candle(side, leg, c) for side, leg, c in closed))
+        final = results[1:]
         for (side, leg, _), candle in zip(closed, final):
             if candle is not None:
-                await self._on_candle_close(side, leg, candle, mkt.eod_squareoff_due, finalized=True)
+                await self._on_candle_close(side, leg, candle, mkt.eod_squareoff_due, finalized=True,
+                                            arm_now=False)
+        await self._arm_best(boundary)
 
     def _restore_realized_pnl(self) -> None:
         """BUG FIXED: balance and realized P&L lived only in memory, so any
@@ -519,8 +568,7 @@ class OptionsEngine:
             # pulse instead of a tick stream or a separate heartbeat.
             self._last_premium[side] = price
 
-            if leg.position is not None:
-                self._check_exits(side, leg, price, squareoff_due, at_time=ts)
+            self._on_tick_price(side, leg, price, squareoff_due, ts)
 
             for candle in leg.candle_builder.update_from_tick(ts, price):
                 self._spawn(self._on_candle_close(side, leg, candle, squareoff_due))
@@ -720,6 +768,9 @@ class OptionsEngine:
             await self._kill_switch()
             return
 
+        if self._armed is not None and now >= self._armed.expires_at + timedelta(seconds=2):
+            await self._expire_armed(now)          # the candle clock normally does this at the boundary
+
         if self.broker is not None:
             await self._poll_live_stops()
             if time.monotonic() - self._funds_checked_at > _FUNDS_REFRESH_SECS:
@@ -841,6 +892,7 @@ class OptionsEngine:
             self.put_strike = self.call_strike = None
             self.expiry = None
             self._last_exit_at = {}
+            self._armed, self._arm_candidates = None, {}
             self.legs = {side: self._new_leg(side) for side in _LEGS}
             self._save_state()
 
@@ -865,6 +917,7 @@ class OptionsEngine:
             "put_strike": self.put_strike, "call_strike": self.call_strike,
             "expiry": self.expiry,
             "last_exit_at": {s: ts.isoformat() for s, ts in self._last_exit_at.items()},
+            "armed": self._armed_state(),
             "positions": positions,
         }
 
@@ -881,6 +934,8 @@ class OptionsEngine:
         self.put_strike = state.get("put_strike")
         self.call_strike = state.get("call_strike")
         self.expiry = state.get("expiry")
+        if state.get("armed"):
+            self._armed_restore = state["armed"]
         for s, iso in (state.get("last_exit_at") or {}).items():
             try:
                 self._note_exit(s, datetime.fromisoformat(iso))
@@ -1091,7 +1146,7 @@ class OptionsEngine:
         )
 
     async def _on_candle_close(self, side: str, leg: LegState, candle: Candle, squareoff_due: bool,
-                               finalized: bool = False) -> None:
+                               finalized: bool = False, arm_now: bool = True) -> None:
         if not finalized:
             candle = await self._finalize_candle(side, leg, candle)
             if candle is None:
@@ -1139,6 +1194,16 @@ class OptionsEngine:
             synthetic=getattr(candle, "synthetic", False),
         )
 
+        if self.config.entry_mode == "break":
+            # Version 2: candle 2 (RED right after a GREEN) has just closed —
+            # its HA Low is final, so the SELL can be parked now and fill during
+            # candle 3. Nothing is ever sold at candle 3's close in this mode.
+            if new_stage == SignalEngine.STAGE_LEVEL_SET and old_stage == SignalEngine.STAGE_GREEN_SEEN:
+                self._arm_candidates[side] = (leg, candle, float(ha_row["ha_low"]), float(ha_row["ha_high"]))
+                if arm_now:
+                    await self._arm_best(candle.end_ts)
+            return
+
         if decision.signal != "SELL":
             return
 
@@ -1169,6 +1234,394 @@ class OptionsEngine:
             side, leg, entry_price=float(candle.close), initial_cover=initial_cover,
             at_time=candle.end_ts, signal_price=float(ha_row["ha_close"]), decided=after,
         )
+
+    # ── Version-2 entry: SELL parked at candle 2's HA Low − offset ──────────
+
+    def _sell_price_for(self, level: float) -> float:
+        return to_tick(level - self.config.entry_offset_pts, up=False)
+
+    def _price_now(self, side: str, fallback: float) -> float:
+        p = self._last_premium.get(side)
+        return p if p and p > 0 else fallback
+
+    def _trades_today(self, side: str) -> int:
+        n = sum(1 for t in self.ledger.get_today_trades() if t.get("leg") == side)
+        return n + (1 if self.legs[side].position is not None else 0)
+
+    def _arm_skip_reason(self, side: str, leg: LegState, candle2: Candle) -> Optional[str]:
+        """Why candle 2 must NOT get a sell order — the same rules as any entry,
+        judged for candle 3 (the candle the sell would happen in)."""
+        if leg.unverified_bucket is not None and candle2.start_ts == leg.unverified_bucket:
+            return "candle 2 was only partly seen and couldn't be verified"
+        if self._armed is not None:
+            return f"{self._armed.side} sell order already waiting (one order at a time)"
+        tf = timedelta(seconds=self.config.candle_timeframe_secs)
+        candle3 = dc_replace(candle2, start_ts=candle2.end_ts, end_ts=candle2.end_ts + tf)
+        squareoff = get_market_status(now=candle3.end_ts).eod_squareoff_due
+        return self._entry_skip_reason(side, leg, candle3, squareoff)
+
+    async def _arm_best(self, boundary: datetime) -> None:
+        """Place at most ONE sell for the candle-2 candidates of this boundary.
+        Both CE and PE ready: the side with fewer trades today; if equal, the
+        side whose sell price is closer to its current price."""
+        cands, self._arm_candidates = self._arm_candidates, {}
+        if not cands:
+            return
+        await self._expire_armed(boundary)
+        tf = timedelta(seconds=self.config.candle_timeframe_secs)
+        ready = {}
+        for side in _LEGS:
+            if side not in cands:
+                continue
+            leg, candle, level, high = cands[side]
+            window = f"{candle.end_ts.astimezone(_IST):%H:%M}-{(candle.end_ts + tf).astimezone(_IST):%H:%M}"
+            if leg is not self.legs.get(side):
+                continue
+            reason = self._arm_skip_reason(side, leg, candle)
+            if reason:
+                logger.info("[%-2s] %s IST    -> NO SELL ORDER: %s", side, window, reason)
+                self.ledger.log_event("SIGNAL_SKIPPED", symbol=side,
+                                      details=f"candle={window} reason={reason} ha_close=0")
+                continue
+            ready[side] = (leg, candle, level, high, window)
+        if len(ready) == 2:
+            count = {s: self._trades_today(s) for s in ready}
+            gap = {s: self._price_now(s, ready[s][1].close) - self._sell_price_for(ready[s][2]) for s in ready}
+            if count["CE"] != count["PE"]:
+                pick = min(ready, key=lambda s: count[s])
+                why = f"fewer trades today — CE {count['CE']}, PE {count['PE']}"
+            else:
+                pick = min(ready, key=lambda s: gap[s])
+                why = (f"same trades today ({count['CE']}); its sell price is closer to the market — "
+                       f"CE {gap['CE']:.2f} away, PE {gap['PE']:.2f} away")
+            other = "PE" if pick == "CE" else "CE"
+            logger.info("CE and PE both ready — one order only: %s (%s). %s gets no order.", pick, why, other)
+            self.ledger.log_event("SIGNAL_SKIPPED", symbol=other,
+                                  details=f"candle={ready[other][4]} reason=both ready - {pick} chosen ({why}) ha_close=0")
+            ready = {pick: ready[pick]}
+        for side, (leg, candle, level, high, window) in ready.items():
+            await self._arm(side, leg, candle, level, high, window)
+
+    async def _size_entry(self, side: str, leg: LegState, price: float) -> Tuple[int, int, float, bool]:
+        """(lots, qty, margin per lot, margin is live) — the same sizing as _enter."""
+        lot_size = leg.lot_size or self.config.lot_size
+        per_lot, is_live = await self.client.margin_per_lot_async(
+            leg.security_id, self.config.option_exchange_segment, price, lot_size, self.config.fallback_margin_per_lot)
+        capital = self.balance
+        if self.broker is not None and self._broker_funds is not None:
+            capital = min(capital, self._broker_funds)
+        lots = math.floor(capital / self.config.max_concurrent / per_lot) if per_lot > 0 else 0
+        lots = min(lots, self.config.max_lots_per_trade)
+        if self.broker is not None:
+            lots = min(lots, self.config.live_max_lots)
+        return lots, lots * lot_size, per_lot, is_live
+
+    async def _arm(self, side: str, leg: LegState, candle2: Candle, level: float, high: float, window: str) -> None:
+        """Candle 2 closed: park the SELL for candle 3."""
+        tf = timedelta(seconds=self.config.candle_timeframe_secs)
+        trigger = self._sell_price_for(level)
+        self._entry_in_flight = side                 # strikes can't switch from here on
+        try:
+            lots, qty, per_lot, margin_live = await self._size_entry(side, leg, trigger)
+            if leg is not self.legs.get(side):
+                return
+            if lots < 1:
+                self.ledger.log_event("BLOCKED_MARGIN", symbol=side,
+                                      details=f"per_lot_margin={per_lot:.0f} live={margin_live} balance={self.balance:.0f}")
+                logger.warning("[%-2s] %s: no sell order — funds can't cover 1 lot (margin/lot Rs %.0f).",
+                               side, window, per_lot)
+                return
+            a = ArmedEntry(side, leg, level, trigger, high, window, candle2.end_ts, candle2.end_ts + tf,
+                           lots, qty, per_lot, margin_live)
+            after = _decided_after(candle2.end_ts)
+            now_price = self._price_now(side, float(candle2.close))
+            if now_price <= trigger + 1e-9:
+                logger.info("[%-2s] %s: price %.2f is already at/below the sell price %.2f (HA Low %.2f − %g) "
+                            "— selling at market now%s", side, window, now_price, trigger, level,
+                            self.config.entry_offset_pts, after)
+                self._armed = a
+                await self._sell_now(a, now_price)
+                return
+            if self.broker is None:
+                self._armed = a
+                self._save_state()
+                logger.info("[%-2s] SELL ORDER %5.0f | sell at %.2f (candle 2 HA Low %.2f − %g) during %s | "
+                            "stop %.2f | x%d (paper)%s", side, leg.strike or 0, trigger, level,
+                            self.config.entry_offset_pts, window, high, qty, after)
+                self.ledger.log_event("ENTRY_ARMED", symbol=side,
+                                      details=f"window={window} sell={trigger:.2f} level={level:.2f} stop={high:.2f} qty={qty}")
+                return
+            limit = to_tick(trigger * (1 - self.config.entry_limit_buffer_pct / 100.0), up=False)
+            order_id, msg = await self.broker.place_async(
+                "SELL", leg.security_id, qty, "STOP_LOSS", price=limit, trigger=trigger, tag=new_tag())
+            if order_id is None:
+                if "trigger" in msg.lower() or "ltp" in msg.lower():
+                    # Refused because the price is already through the sell price.
+                    logger.info("[%-2s] %s: sell order refused (%s) — price is already through %.2f, "
+                                "selling at market now.", side, window, msg, trigger)
+                    self._armed = a
+                    await self._sell_now(a, self._price_now(side, trigger))
+                    return
+                logger.error("[%-2s] %s: sell order REFUSED by Dhan (%s) — no trade.", side, window, msg)
+                self.ledger.log_event("ORDER_FAILED", symbol=side, details=f"SELL STOP_LOSS trigger={trigger:.2f} {msg}")
+                return
+            a.order_id = order_id
+            self._armed = a
+            self._save_state()
+            logger.info("[%-2s] SELL ORDER %5.0f | x%d parked AT THE EXCHANGE: trigger %.2f limit %.2f "
+                        "(candle 2 HA Low %.2f − %g) for %s | stop %.2f | order %s%s",
+                        side, leg.strike or 0, qty, trigger, limit, level, self.config.entry_offset_pts,
+                        window, high, order_id, _decided_after(candle2.end_ts))
+            self.ledger.log_event("ENTRY_ARMED", symbol=side,
+                                  details=f"window={window} sell={trigger:.2f} limit={limit:.2f} level={level:.2f} "
+                                          f"stop={high:.2f} qty={qty} order={order_id}")
+            self._spawn(self._watch_armed(a))
+        finally:
+            self._entry_in_flight = None
+
+    async def _sell_now(self, a: ArmedEntry, price_now: float) -> None:
+        """The price was already through the sell price when candle 2 closed."""
+        side, leg = a.side, a.leg
+        if self.broker is None:
+            self._book_entry_fill(a, price_now, a.qty, f"PAPER-{uuid.uuid4().hex[:10]}", a.armed_at, "market, paper")
+            return
+        self._entry_in_flight = side
+        try:
+            fill = await self._live_order("SELL", side, leg, a.qty, ref_price=a.trigger)
+        finally:
+            self._entry_in_flight = None
+        if not fill.ok:
+            a.state = "CANCELLED"
+            if self._armed is a:
+                self._armed = None
+            self._save_state()
+            self.ledger.log_event("ORDER_FAILED", symbol=side,
+                                  details=f"SELL x{a.qty} {fill.status} order={fill.order_id} reason={fill.message}")
+            logger.error("[%-2s] LIVE SELL NOT FILLED (%s): %s — no position opened.", side, fill.status, fill.message)
+            return
+        if self._book_entry_fill(a, fill.avg_price, fill.filled_qty, fill.order_id,
+                                 datetime.now(timezone.utc), f"LIVE market order {fill.order_id}"):
+            await self._protect_new_entry(a)
+
+    def _book_entry_fill(self, a: ArmedEntry, price: float, qty: int, order_id: str,
+                         at_time: datetime, how: str) -> bool:
+        """The sell filled: open the position (once). False if already done."""
+        if a.state != "ARMED" or qty <= 0:
+            return False
+        a.state = "FILLED"
+        if self._armed is a:
+            self._armed = None
+        side, leg = a.side, a.leg
+        if leg is not self.legs.get(side) or leg.position is not None:
+            logger.critical("[%-2s] a sell filled (%s x%d @ %.2f) but the engine can't attach it to its leg — "
+                            "check the Dhan app.", side, order_id, qty, price)
+            return False
+        leg.position = OpenPosition(symbol=side, entry_price=price, qty=qty, entry_order_id=order_id,
+                                    cover_level=a.stop, entry_time=at_time)
+        if self.broker is not None:
+            self._last_fill_at[str(leg.security_id)] = time.monotonic()
+        lot_size = leg.lot_size or self.config.lot_size
+        self.ledger.record_entry(
+            ("ENTRY", side,
+             f"strike={leg.strike} fill={price:.2f} sell_price={a.trigger:.2f} level={a.level:.2f} "
+             f"lots={a.lots} qty={qty} lot_size={lot_size}({'live' if leg.lot_size else 'configured'}) "
+             f"margin_per_lot={a.per_lot_margin:.0f}({'live' if a.margin_live else 'fallback'}) "
+             f"stop={a.stop:.2f} order={order_id} mode=break"),
+            self._current_state_dict(),
+        )
+        logger.info("[%-2s] SELL  %7.0f | fill %7.2f (%s) | sell price %.2f (HA Low %.2f − %g) | x%-4d (%d lot) | "
+                    "stop %7.2f | margin/lot Rs %8.0f (%s) | filled %s",
+                    side, leg.strike or 0, price, how, a.trigger, a.level, self.config.entry_offset_pts,
+                    qty, a.lots, a.stop, a.per_lot_margin, "live" if a.margin_live else "fallback",
+                    f"{at_time.astimezone(_IST):%H:%M:%S.%f}"[:-3])
+        return True
+
+    async def _protect_new_entry(self, a: ArmedEntry) -> None:
+        """Sell first, stop second: the buy stop goes in the moment the sell is known."""
+        side, leg = a.side, a.leg
+        if self.broker is None or leg.position is None:
+            return
+        t0 = time.monotonic()
+        await self._place_protective_stop(side, leg)
+        pos = leg.position
+        if pos is not None and pos.stop_order_id:
+            logger.info("[%-2s] protected: stop %.2f at the exchange %.0f ms after the fill was known.",
+                        side, pos.stop_trigger_sent, (time.monotonic() - t0) * 1000.0)
+        if pos is not None:
+            self._spawn(self._verify_entry_price(side, leg, pos.entry_order_id, pos.entry_price))
+
+    def _on_tick_price(self, side: str, leg: LegState, price: float, squareoff_due: bool,
+                       ts: datetime) -> None:
+        """Every price for a leg: a waiting sell (paper fill / live nudge), then exits."""
+        self._last_premium[side] = price
+        a = self._armed
+        if a is not None and a.side == side and a.leg is leg and a.state == "ARMED":
+            if self.broker is None:
+                if ts < a.expires_at and price <= a.trigger + 1e-9:
+                    self._book_entry_fill(a, price, a.qty, f"PAPER-{uuid.uuid4().hex[:10]}", ts, "paper")
+            elif price <= a.trigger + 1e-9:
+                a.kick.set()                      # the feed saw it: ask the exchange right now
+        if leg.position is not None:
+            self._check_exits(side, leg, price, squareoff_due, at_time=ts)
+
+    async def _watch_armed(self, a: ArmedEntry) -> None:
+        """Live: wait for the parked sell to fill — Dhan pushes it (~10 ms);
+        REST is asked every _ARM_POLL_SECS, and at once when the feed shows the
+        price at the sell price."""
+        stream = self.broker.stream
+        last_rest = 0.0
+        while a.state == "ARMED" and self._running:
+            st = None
+            pushed = stream.latest(a.order_id) if stream is not None else None
+            if pushed:
+                st = OrderUpdateStream.to_result(a.order_id, pushed)
+            if (st is None or st.filled_qty <= 0) and (a.kick.is_set() or
+                                                       time.monotonic() - last_rest >= _ARM_POLL_SECS):
+                a.kick.clear()
+                last_rest = time.monotonic()
+                st = await self.broker.status_async(a.order_id)
+            if a.state != "ARMED":
+                return
+            if st is not None and st.filled_qty > 0:
+                await self._armed_filled(a, st)
+                return
+            if st is not None and st.status in ("REJECTED", "CANCELLED", "EXPIRED"):
+                async with a.lock:
+                    if a.state == "ARMED":
+                        a.state = "CANCELLED"
+                        if self._armed is a:
+                            self._armed = None
+                        self._save_state()
+                        logger.warning("[%-2s] the waiting sell order %s is %s at Dhan (%s) — no trade.",
+                                       a.side, a.order_id, st.status, st.message)
+                return
+            waiters = [asyncio.ensure_future(a.kick.wait())]
+            if stream is not None and stream.connected:
+                waiters.append(asyncio.ensure_future(stream.wait_change(a.order_id, _ARM_POLL_SECS)))
+            await asyncio.wait(waiters, timeout=_ARM_POLL_SECS, return_when=asyncio.FIRST_COMPLETED)
+            for w in waiters:
+                if not w.done():
+                    w.cancel()
+
+    async def _armed_filled(self, a: ArmedEntry, st: OrderResult) -> None:
+        booked = False
+        async with a.lock:
+            if a.state != "ARMED":
+                return
+            if st.status != "TRADED" and st.filled_qty < a.qty:
+                # Partly filled: give the rest a moment, then cancel it and keep what filled.
+                deadline = time.monotonic() + _PART_FILL_WAIT_SECS
+                while time.monotonic() < deadline:
+                    st = await self.broker.status_async(a.order_id)
+                    if st.status == "TRADED" or st.filled_qty >= a.qty:
+                        break
+                    await asyncio.sleep(0.2)
+                if st.status != "TRADED" and st.filled_qty < a.qty:
+                    await self.broker.cancel_async(a.order_id)
+                    st = await self._settled_status(a.order_id)
+                    logger.warning("[%-2s] sell only partly filled (%d of %d) — rest cancelled.",
+                                   a.side, st.filled_qty, a.qty)
+            avg = st.avg_price
+            if avg <= 0:
+                avg = (await self.broker.status_async(a.order_id)).avg_price or a.trigger
+            booked = self._book_entry_fill(a, avg, min(st.filled_qty, a.qty), a.order_id,
+                                           datetime.now(timezone.utc), f"LIVE order {a.order_id}")
+        if booked:
+            await self._protect_new_entry(a)
+
+    async def _expire_armed(self, boundary: datetime, why: str = "") -> None:
+        """Candle 3 has closed (or the engine is stopping): cancel the waiting
+        sell. If it filled meanwhile, open the position instead."""
+        a = self._armed
+        if a is None or (not why and a.expires_at > boundary + timedelta(seconds=1)):
+            return
+        booked = False
+        async with a.lock:
+            if a.state != "ARMED":
+                if self._armed is a:
+                    self._armed = None
+                return
+            if self.broker is None:
+                a.state = "EXPIRED"
+                self._armed = None
+                self._save_state()
+                logger.info("[%-2s] %s: price never reached %.2f — sell order cancelled%s.",
+                            a.side, a.window, a.trigger, f" ({why})" if why else "")
+                self.ledger.log_event("ENTRY_EXPIRED", symbol=a.side, details=f"window={a.window} sell={a.trigger:.2f} {why}")
+                return
+            ok, msg = await self.broker.cancel_async(a.order_id)
+            st = await self._settled_status(a.order_id)
+            if st.filled_qty > 0:
+                booked = self._book_entry_fill(a, st.avg_price or a.trigger, min(st.filled_qty, a.qty), a.order_id,
+                                               datetime.now(timezone.utc), f"LIVE order {a.order_id}")
+            elif st.status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                a.state = "EXPIRED"
+                if self._armed is a:
+                    self._armed = None
+                self._save_state()
+                logger.info("[%-2s] %s: price never reached %.2f — sell order %s cancelled%s.",
+                            a.side, a.window, a.trigger, a.order_id, f" ({why})" if why else "")
+                self.ledger.log_event("ENTRY_EXPIRED", symbol=a.side,
+                                      details=f"window={a.window} sell={a.trigger:.2f} order={a.order_id} {why}")
+            else:
+                logger.critical("[%-2s] waiting sell order %s is still %s after the cancel (%s) — retrying; "
+                                "check the Dhan app.", a.side, a.order_id, st.status, msg)
+        if booked:
+            await self._protect_new_entry(a)
+
+    async def _cancel_armed(self, why: str) -> None:
+        if self._armed is not None:
+            await self._expire_armed(self._armed.expires_at, why=why)
+
+    def _armed_state(self) -> Optional[dict]:
+        a = self._armed
+        if a is None or self.broker is None:
+            return None
+        leg = a.leg
+        return {"side": a.side, "order_id": a.order_id, "level": a.level, "trigger": a.trigger, "stop": a.stop,
+                "window": a.window, "armed_at": a.armed_at.isoformat(), "expires_at": a.expires_at.isoformat(),
+                "lots": a.lots, "qty": a.qty, "strike": leg.strike, "security_id": leg.security_id,
+                "lot_size": leg.lot_size}
+
+    async def _recover_armed(self) -> None:
+        """Startup (live): a sell left waiting by the previous run is cancelled;
+        if it filled while the engine was down, that position is taken over
+        (its stop is placed by _reconcile_live right after)."""
+        d, self._armed_restore = self._armed_restore, None
+        if not d or not d.get("order_id"):
+            return
+        st = await self.broker.status_async(d["order_id"])
+        if st.status not in _ORDER_DONE:
+            await self.broker.cancel_async(d["order_id"])
+            st = await self._settled_status(d["order_id"])
+        if st.filled_qty <= 0:
+            logger.info("[%-2s] the previous run's waiting sell order %s is %s — nothing to take over.",
+                        d["side"], d["order_id"], st.status)
+            return
+        side = d["side"]
+        leg = self.legs[side]
+        leg.strike, leg.security_id, leg.lot_size = d.get("strike"), d.get("security_id"), d.get("lot_size")
+        a = ArmedEntry(side, leg, d["level"], d["trigger"], d["stop"], d["window"],
+                       datetime.fromisoformat(d["armed_at"]), datetime.fromisoformat(d["expires_at"]),
+                       d.get("lots", 1), d.get("qty", st.filled_qty), 0.0, False, order_id=d["order_id"])
+        logger.warning("[%-2s] the sell order %s FILLED while the engine was down (x%d @ %.2f) — taking it over.",
+                       side, d["order_id"], st.filled_qty, st.avg_price)
+        self._book_entry_fill(a, st.avg_price or a.trigger, st.filled_qty, d["order_id"],
+                              datetime.now(timezone.utc), "filled while the engine was down")
+
+    async def _cancel_orphan_sells(self) -> None:
+        """Startup (live): no SELL stop order of this engine may be left waiting
+        at the exchange from a run that didn't shut down cleanly."""
+        orders = await self.broker.orders_async()
+        for o in orders or []:
+            if (str(o.get("transactionType", "")).upper() == "SELL"
+                    and str(o.get("orderType", "")).upper() in ("STOP_LOSS", "STOP_LOSS_MARKET")
+                    and str(o.get("orderStatus", "")).upper() in ("PENDING", "TRANSIT", "TRIGGERED")
+                    and str(o.get("correlationId") or "").startswith("AP")):
+                oid = str(o.get("orderId"))
+                ok, msg = await self.broker.cancel_async(oid)
+                logger.warning("Cancelled a sell order left waiting by an earlier run (%s %s, trigger %s)%s.",
+                               oid, o.get("tradingSymbol", "?"), o.get("triggerPrice"), "" if ok else f" — FAILED: {msg}")
 
     async def _fetch_bar(self, leg: LegState, candle: Candle, max_wait: float) -> Optional[dict]:
         """DhanHQ's own bar for `candle`'s bucket, asked for until it appears
@@ -1850,6 +2303,8 @@ class OptionsEngine:
                             "(Token / Trading API access / network.)")
             self.stop()
             return
+        await self._recover_armed()
+        await self._cancel_orphan_sells()
         broker: Dict[str, int] = {}
         for p in positions:
             if str(p.get("exchangeSegment", "")).upper() == self.config.option_exchange_segment:
@@ -1902,6 +2357,7 @@ class OptionsEngine:
 
     async def _kill_switch(self) -> None:
         logger.critical("KILL SWITCH (%s exists) — squaring off everything and stopping.", KILL_SWITCH_FILE)
+        await self._cancel_armed("kill switch")
         for side in _LEGS:
             leg = self.legs[side]
             if leg.position is None:

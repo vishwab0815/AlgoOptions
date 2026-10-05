@@ -208,12 +208,17 @@ def _print_banner(config) -> None:
            else f"{min(config.max_lots_per_trade, config.live_max_lots)} (live cap)"),
         f"│  {'sizing':<18} floor(capital / {config.max_concurrent} / live DhanHQ margin-per-lot)",
         _section("STRATEGY"),
-        f"│  {'entry':<18} HA GREEN -> RED -> RED breakout, sell-to-open only",
+        (f"│  {'entry':<18} HA GREEN -> RED: SELL parked at the exchange at candle 2's HA Low - "
+         f"{config.entry_offset_pts:g}, fills during candle 3 (else cancelled); sell-to-open only"
+         if config.entry_mode == "break" else
+         f"│  {'entry':<18} HA GREEN -> RED -> RED breakout at candle 3's close, sell-to-open only"),
         f"│  {'gates':<18} pattern only — no RSI, no volume filter",
         f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open",
         f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
         f"│  {'entries':<18} from {config.entry_start} IST, none after 15:00",
-        f"│  {'fills':<18} market price at signal (raw close); stop fills at the tick that hits it",
+        (f"│  {'fills':<18} the exchange fills the sell at its price; buy stop placed right after the fill"
+         if config.entry_mode == "break" else
+         f"│  {'fills':<18} market price at signal (raw close); stop fills at the tick that hits it"),
         f"│  {'exit':<18} stop = HA high 2 candles back (trails each close) + 15:00 square-off",
         (f"│  {'profit lock':<18} {config.profit_lock_start_pts:g} pts below entry, then every "
          f"{config.profit_lock_step_pts:g} pts (one step behind); buy back when it comes back"

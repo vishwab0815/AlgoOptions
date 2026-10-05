@@ -297,6 +297,14 @@ class DhanBroker:
             return None
         return body[0] if isinstance(body, list) and body else (body if isinstance(body, dict) else None)
 
+    def orders(self) -> Optional[List[dict]]:
+        """Today's order book."""
+        try:
+            code, body = self._call("GET", "/orders")
+        except requests.RequestException:
+            return None
+        return body if code == 200 and isinstance(body, list) else None
+
     def trades(self) -> Optional[List[dict]]:
         """Today's trade book: every fill, with its own price and time."""
         try:
@@ -357,6 +365,9 @@ class DhanBroker:
 
     async def trades_async(self):
         return await asyncio.to_thread(self.trades)
+
+    async def orders_async(self):
+        return await asyncio.to_thread(self.orders)
 
     async def funds_async(self):
         return await asyncio.to_thread(self.available_funds)

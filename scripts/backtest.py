@@ -40,6 +40,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from itertools import groupby
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -83,14 +84,18 @@ def _walk_bar(e, side, leg, c, at) -> None:
     prev = None
     for p in path:
         pos = leg.position
-        if pos is None:
+        a = e._armed
+        waiting = a is not None and a.side == side and a.leg is leg and a.state == "ARMED"
+        if pos is None and not waiting:
             return
-        if prev is not None and p > prev:
+        if prev is not None and p > prev and pos is not None:
             for level in sorted(x for x in (pos.cover_level, pos.lock_price) if x > 0 and prev < x < p):
                 e._check_exits(side, leg, level, False, at_time=at)
                 if leg.position is None:
                     return
-        e._check_exits(side, leg, p, False, at_time=at)
+        elif prev is not None and p < prev and waiting and p < a.trigger < prev:
+            e._on_tick_price(side, leg, a.trigger, False, at)        # the waiting sell fills at its price
+        e._on_tick_price(side, leg, p, False, at)
         prev = p
 
 
@@ -174,29 +179,41 @@ async def _replay_day(cfg, client, day: date, expiry: str, independent: bool, tm
     tf = timedelta(seconds=cfg.candle_timeframe_secs)
     stream = sorted(((c["timestamp"], side, c) for side in _LEGS for c in bars[side][1]),
                     key=lambda x: (x[0], x[1]))
-    for ts, side, c in stream:
-        e = engines[side if independent else "both"]
-        leg = e.legs[side]
+    unique = list({id(x): x for x in engines.values()}.values())
+    for ts, group in groupby(stream, key=lambda x: x[0]):
+        group = list(group)
         start = datetime.fromtimestamp(ts, tz=timezone.utc)
         start_ist = start.astimezone(_IST)
-
-        # Exits inside this bar, priced as the live engine would see them.
-        pos = leg.position
-        if pos is not None:
-            if start_ist.strftime("%H:%M") >= "15:00":
+        # 1) inside this bar (both legs): a waiting sell may fill, open trades may exit
+        for _, side, c in group:
+            e = engines[side if independent else "both"]
+            leg = e.legs[side]
+            pos = leg.position
+            a = e._armed
+            waiting = a is not None and a.side == side and a.leg is leg
+            if pos is not None and start_ist.strftime("%H:%M") >= "15:00":
                 e._check_exits(side, leg, c["open"], True, at_time=start_ist)      # first tick after 15:00
-            else:
+            elif pos is not None or waiting:
                 _walk_bar(e, side, leg, c, start_ist)
-
-        candle = Candle(symbol=side, exchange_segment=2, security_id=leg.security_id,
-                        start_ts=start, end_ts=start + tf, open=c["open"], high=c["high"],
-                        low=c["low"], close=c["close"], volume=c.get("volume", 0.0))
-        squareoff_at_close = (start + tf).astimezone(_IST).strftime("%H:%M") >= "15:00"
-        if independent:
-            # The 'my sheet' model: every signal on each leg, so the live
-            # engine's fresh-pattern-after-exit rule doesn't apply here.
-            e._last_exit_at.clear()
-        await e._on_candle_close(side, leg, candle, squareoff_at_close)
+            e._last_premium[side] = c["close"]
+        # 2) the bar closes: an unfilled sell is cancelled, then each leg's candle is evaluated
+        for e in unique:
+            await e._expire_armed(start + tf)
+        for _, side, c in group:
+            e = engines[side if independent else "both"]
+            leg = e.legs[side]
+            candle = Candle(symbol=side, exchange_segment=2, security_id=leg.security_id,
+                            start_ts=start, end_ts=start + tf, open=c["open"], high=c["high"],
+                            low=c["low"], close=c["close"], volume=c.get("volume", 0.0))
+            squareoff_at_close = (start + tf).astimezone(_IST).strftime("%H:%M") >= "15:00"
+            if independent:
+                # The 'my sheet' model: every signal on each leg, so the live
+                # engine's fresh-pattern-after-exit rule doesn't apply here.
+                e._last_exit_at.clear()
+            await e._on_candle_close(side, leg, candle, squareoff_at_close, arm_now=False)
+        # 3) one sell order for the next bar (CE vs PE decided together, as live)
+        for e in unique:
+            await e._arm_best(start + tf)
 
     trades, skips = [], Counter()
     for e in engines.values():

@@ -148,6 +148,17 @@ class OptionsConfig:
     # premium is `start` points below the entry, buy back if it comes back to
     # that level; every further `step` points down moves the lock one step
     # behind (sold 123: touch 113 -> lock 113; 110 -> 113; 107 -> 110; ...).
+    # Entry (version 2). "break": when candle 2 (RED after GREEN) closes, a
+    # SELL is parked at the exchange at candle 2's HA Low minus
+    # entry_offset_pts; it fills the moment candle 3's price reaches it, and is
+    # cancelled if candle 3 closes first. "close": the original entry — sell
+    # at candle 3's close when it broke the level.
+    entry_mode: str = "break"
+    entry_offset_pts: float = 1.0
+    # The parked sell is a stop-limit: once triggered it may fill down to this
+    # % below the sell price (so a fast drop still fills).
+    entry_limit_buffer_pct: float = 3.0
+
     profit_lock: bool = True
     profit_lock_start_pts: float = 10.0
     profit_lock_step_pts: float = 3.0
@@ -182,6 +193,13 @@ class OptionsConfig:
     # conservative, with an additional 15s cool-off automatically applied
     # after any 429 (see dhan_client.py).
     chain_min_interval_secs: float = 5.0
+
+
+def _entry_mode(raw: str) -> str:
+    mode = raw.strip().lower()
+    if mode not in ("break", "close"):
+        raise OptionsConfigError(f"OPTIONS_ENTRY_MODE={raw!r} — use 'break' or 'close'.")
+    return mode
 
 
 def _positive(raw: str, name: str) -> float:
@@ -280,6 +298,9 @@ def load_options_config() -> OptionsConfig:
         candle_close_grace_ms=max(0, int(os.getenv("OPTIONS_CANDLE_CLOSE_GRACE_MS", "0"))),
         official_candles=os.getenv("OPTIONS_OFFICIAL_CANDLES", "true").strip().lower() == "true",
         official_candle_wait_ms=max(0, int(os.getenv("OPTIONS_OFFICIAL_CANDLE_WAIT_MS", "1500"))),
+        entry_mode=_entry_mode(os.getenv("OPTIONS_ENTRY_MODE", "break")),
+        entry_offset_pts=max(0.0, float(os.getenv("OPTIONS_ENTRY_OFFSET_POINTS", "1"))),
+        entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
         profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "10"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
