@@ -163,13 +163,15 @@ class OptionsConfig:
     profit_lock_start_pts: float = 10.0
     profit_lock_step_pts: float = 3.0
 
-    # No new entries before this IST time (HH:MM). market_hours.py always
-    # documented a post-open buffer; the engine never enforced it. Set to
-    # 09:15 to allow entries from the open.
-    entry_start: str = "09:30"
+    # No new entries before this IST time (HH:MM). 09:15 = from the open
+    # (the pattern needs 3 candles, so the first possible sell is 09:25-09:30).
+    entry_start: str = "09:15"
     # On expiry day, trade next week's contract instead of the one settling
     # at 15:30 today (0 DTE). Off by default = trade the nearest expiry.
     roll_on_expiry_day: bool = False
+    # Stop the engine by itself once the market has closed (HH:MM IST, and only
+    # when no position is open). "" = run until stopped by hand.
+    auto_stop_at: str = "15:31"
 
     # Cost model applied to every paper fill — see charges.py. Defaults are
     # ESTIMATES of published Indian F&O rates and change with budgets and
@@ -305,8 +307,10 @@ def load_options_config() -> OptionsConfig:
         profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "10"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),
-        entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:30")),
+        entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:15")),
         roll_on_expiry_day=os.getenv("OPTIONS_ROLL_ON_EXPIRY_DAY", "false").strip().lower() == "true",
+        auto_stop_at=(_hhmm(os.getenv("OPTIONS_AUTO_STOP_AT", "15:31"))
+                      if os.getenv("OPTIONS_AUTO_STOP_AT", "15:31").strip() else ""),
         apply_charges=os.getenv("OPTIONS_APPLY_CHARGES", "true").strip().lower() == "true",
         brokerage_per_order=float(os.getenv("OPTIONS_BROKERAGE_PER_ORDER", "20.0")),
         stt_pct=float(os.getenv("OPTIONS_STT_PCT", "0.10")),

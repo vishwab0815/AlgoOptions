@@ -1,5 +1,9 @@
 # ── Credentials & Secrets ────────────────────────────────────────────────────
 .env
+.env.bak
+.env.tmp
+secrets.env
+*.zip
 .env.local
 .env.*.local
 

@@ -66,9 +66,42 @@ cp .env.example .env      # DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN (same account)
 python run_options.py
 ```
 
-The access token lasts 24 h — regenerate daily (`scripts/generate_token.py`).
-The engine refuses to start with an expired token, or one issued for a
-different client id.
+The access token lasts 24 h. The engine refuses to start with an expired
+token, or one issued for a different client id, and on a weekend or NSE
+holiday (`algopilot/utils/market_calendar.py`). It stops by itself at 15:31
+once flat (`OPTIONS_AUTO_STOP_AT`), or cleanly at any time when `data/STOP`
+exists.
+
+## Running unattended (VM)
+
+Once, on the VM:
+
+1. Dhan → My Profile → Access DhanHQ APIs → **Set-up TOTP** (keep the text key).
+2. Copy `secrets.env.example` to `secrets.env` and fill in `DHAN_PIN` and
+   `DHAN_TOTP_SECRET`. It stays on the VM: git-ignored, never logged.
+3. `python scripts/auto_token.py --check` — checks the setup (no Dhan call);
+   the code it shows must match your authenticator app.
+4. `python scripts/daily_pipeline.py` — **start it once and leave it running.**
+5. Optional: `python scripts/daily_pipeline.py --install` — it also starts by
+   itself whenever you sign in to Windows (e.g. after a reboot).
+
+While it runs:
+
+- **every night at 21:00 IST** a new access token (PIN + TOTP) is made,
+  checked with Dhan and written to `.env` (Dhan has no revoke call — the old
+  token is replaced and expires by itself; a token lasts 24 h, so tonight's
+  covers tomorrow). If the VM was off at 21:00, one is made before the session.
+- **every trading day from 08:45 IST** the engine is started; at 09:17–09:25
+  it checks NIFTY actually traded (else stops the engine); a crash before the
+  close is restarted (max 5, never with `data/KILL`); the engine stops itself
+  after the close.
+- weekends and NSE holidays: nothing. Update `market_calendar.py` each December.
+
+Log: `data/pipeline.log`. One copy at a time. Keep the VM on (clock on India
+Standard Time); disconnect RDP rather than signing out.
+
+Updating: stop it (Ctrl+C), `git pull`, start it again. `.env`, `secrets.env`
+and `data\` are not in git and stay as they are.
 
 ## Data and analysis
 
@@ -100,5 +133,6 @@ algopilot/
 run_options.py              entry point
 scripts/backtest.py         real-data backtest through the engine's own code
 scripts/export_candle_log.py
-scripts/generate_token.py
+scripts/auto_token.py       today's access token from PIN + TOTP (no browser)
+scripts/daily_pipeline.py   one trading day, unattended (--install creates the Windows task)
 ```

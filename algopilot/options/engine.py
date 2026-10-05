@@ -119,6 +119,10 @@ _BAR_RECHECK_SECS = 20.0
 # Kill switch: create this file (any content) and the engine squares off
 # every open position and stops. It refuses to START while the file exists.
 KILL_SWITCH_FILE = Path("data/KILL")
+# Graceful stop: create this file and the engine stops cleanly WITHOUT
+# squaring off (a waiting sell is cancelled; open positions keep their
+# exchange stops and resume on restart). Used by scripts/daily_pipeline.py.
+STOP_FILE = Path("data/STOP")
 
 # Live mode: how often the broker's available funds are re-read (seconds).
 _FUNDS_REFRESH_SECS = 60.0
@@ -385,6 +389,8 @@ class OptionsEngine:
 
         try:
             while self._running:
+                if self._stop_requested():
+                    break
                 try:
                     await self.maintenance_tick()
                 except Exception:
@@ -523,6 +529,32 @@ class OptionsEngine:
 
     def stop(self) -> None:
         self._running = False
+
+    def _stop_requested(self) -> bool:
+        """data/STOP exists, or the market has closed for the day (auto_stop_at)."""
+        if STOP_FILE.exists():
+            try:
+                STOP_FILE.unlink()
+            except OSError:
+                pass
+            logger.warning("Stop requested (%s) — stopping cleanly. Any open position keeps its exchange stop "
+                           "and is resumed on the next start.", STOP_FILE)
+            self.stop()
+            return True
+        if not self.config.auto_stop_at:
+            return False
+        now = datetime.now(_IST)
+        if now.strftime("%H:%M") < self.config.auto_stop_at:
+            return False
+        if any(leg.position is not None for leg in self.legs.values()):
+            if not getattr(self, "_auto_stop_held", False):
+                self._auto_stop_held = True
+                logger.critical("Past %s IST but a position is still OPEN — not stopping by itself. "
+                                "Check the Dhan app.", self.config.auto_stop_at)
+            return False
+        logger.info("Market closed for the day (past %s IST) — stopping.", self.config.auto_stop_at)
+        self.stop()
+        return True
 
     def _spawn(self, coro) -> None:
         """asyncio.create_task(), but keeping a strong reference so the task

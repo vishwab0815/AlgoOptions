@@ -174,8 +174,8 @@ class OptionsDhanClient:
             logger.error(
                 "DhanHQ REJECTED THE ACCESS TOKEN (HTTP %d on %s). It has expired (tokens last 24h), "
                 "been revoked, or belongs to a different client id than DHAN_CLIENT_ID%s. Nothing can "
-                "be fetched until it is fixed: generate a new token (scripts/generate_token.py), set "
-                "DHAN_ACCESS_TOKEN (and a matching DHAN_CLIENT_ID) in .env, and restart.",
+                "be fetched until it is fixed: generate a new token (python scripts/auto_token.py, "
+                "or set DHAN_ACCESS_TOKEN and a matching DHAN_CLIENT_ID in .env) and restart.",
                 resp.status_code, what,
                 "" if resp.status_code == 401 else ", or this account lacks DhanHQ Data API access",
             )

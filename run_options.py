@@ -158,7 +158,7 @@ def _token_status_line(config) -> str:
     remaining = (expires - now).total_seconds() / 3600.0
     line = f"│  {'access token':<18} valid to {expires:%d-%b %H:%M IST}"
     if remaining <= 0:
-        return line + "  *** EXPIRED — run scripts/generate_token.py ***"
+        return line + "  *** EXPIRED — run: python scripts/auto_token.py ***"
     if _expires_during_session(expires, now):
         return line + "  *** DIES DURING TODAY'S SESSION — regenerate before 09:15 ***"
     if remaining < 2.0:
@@ -268,6 +268,17 @@ async def main() -> int:
 
     _print_banner(config)
 
+    from algopilot.utils.market_calendar import trading_day_status
+    is_open, why = trading_day_status(datetime.now(_IST).date())
+    if not is_open:
+        logger.info("Market closed today — %s. Nothing to do.", why)
+        return 0
+    if why != "trading day":
+        logger.warning(why)
+    if config.auto_stop_at and datetime.now(_IST).strftime("%H:%M") >= config.auto_stop_at:
+        logger.info("Market has already closed for today (after %s IST). Nothing to do.", config.auto_stop_at)
+        return 0
+
     expires = token_expiry_ist(config.access_token.get_secret())
     from algopilot.options.engine import KILL_SWITCH_FILE
     if KILL_SWITCH_FILE.exists():
@@ -280,7 +291,7 @@ async def main() -> int:
         # nothing (no expiry list -> no chain -> no band -> no trades).
         logger.error(
             "Access token expired at %s. Refusing to start. Generate a new one "
-            "(python scripts/generate_token.py), set DHAN_ACCESS_TOKEN in .env, and run again.",
+            "(python scripts/auto_token.py) and run again.",
             f"{expires:%d-%b %H:%M IST}",
         )
         return 1
