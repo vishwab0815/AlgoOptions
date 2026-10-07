@@ -191,8 +191,8 @@ async def _replay_day(cfg, client, day: date, expiry: str, independent: bool, tm
             pos = leg.position
             a = e._armed
             waiting = a is not None and a.side == side and a.leg is leg
-            if pos is not None and start_ist.strftime("%H:%M") >= "15:00":
-                e._check_exits(side, leg, c["open"], True, at_time=start_ist)      # first tick after 15:00
+            if pos is not None and start_ist.strftime("%H:%M") >= cfg.squareoff_at:
+                e._check_exits(side, leg, c["open"], True, at_time=start_ist)      # first tick at the square-off
             elif pos is not None or waiting:
                 _walk_bar(e, side, leg, c, start_ist)
             e._last_premium[side] = c["close"]
@@ -205,7 +205,7 @@ async def _replay_day(cfg, client, day: date, expiry: str, independent: bool, tm
             candle = Candle(symbol=side, exchange_segment=2, security_id=leg.security_id,
                             start_ts=start, end_ts=start + tf, open=c["open"], high=c["high"],
                             low=c["low"], close=c["close"], volume=c.get("volume", 0.0))
-            squareoff_at_close = (start + tf).astimezone(_IST).strftime("%H:%M") >= "15:00"
+            squareoff_at_close = (start + tf).astimezone(_IST).strftime("%H:%M") >= cfg.squareoff_at
             if independent:
                 # The 'my sheet' model: every signal on each leg, so the live
                 # engine's fresh-pattern-after-exit rule doesn't apply here.

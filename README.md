@@ -21,29 +21,44 @@ orders**, recording everything in a local SQLite ledger.
    5-minute candles closed at exactly hh:mm:00.000, then Heikin-Ashi. The
    Heikin-Ashi series continues from previous days (like a chart); the
    opening candle is fetched complete.
-4. **Pattern**, on each leg's own premium (CE and PE tracked all day):
-   `1/3` a GREEN candle arms it; `2/3` the first RED after it sets
-   **level = its HA low**; `3/3` the very next candle — if price trades below
-   the level, that's a signal. Otherwise the pattern is dead until a new GREEN.
-5. **Filters** (skipped signals are logged with the reason): one trade at a
-   time; after a trade either leg may trade next (the same leg only on a fresh
-   pattern — its GREEN must close after the exit); entries only 09:30–15:00;
-   never on a gap-filled candle; daily loss limit; blocked contracts (live).
-6. **Entry** — sell 1 lot at market (sizing: capital / live margin per lot).
-7. **Stop** — while candle N trades, the stop is the **HA high of candle N−2**,
-   moved at every candle close. Checked on every tick, with the option-chain
-   price every 5 s as a backup.
-8. **Profit lock** — sold at 123: once the premium touches 113 (10 points),
-   buy back if it comes back to 113; at 110 the lock stays 113; at 107 it moves
-   to 110; at 104 to 107 — every 3 points, one step behind the best. Live, the
-   lock is parked AT THE EXCHANGE (see below); the engine also watches every tick.
-9. **Exit** — stop hit, profit lock hit, or everything bought back at 15:00.
-9. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
+4. **Pattern**, on each side's own premium (CE and PE watched all day):
+   candle 1 GREEN, then candle 2 RED.
+5. **Sell order** — the moment candle 2 closes, a sell order goes in at
+   **candle 2's HA Low − 0.5** (`OPTIONS_ENTRY_OFFSET_POINTS`). It sells when
+   the price reaches it during candle 3, and is cancelled when candle 3 ends.
+   If the price is already below it, it sells at once.
+6. **Rules** — one trade at a time and one order at a time. Both sides ready
+   together: the side with fewer trades today (if equal, the closer price).
+   A pattern that completes while the **other** side's trade is open waits:
+   if that trade closes before its candle 3 ends, the sell order goes in then
+   (or it sells at once if the price is already below). The same side trades
+   again only after a GREEN that closes after its exit (the exit candle itself
+   counts if it closes GREEN). No new trades after the square-off time or
+   after the daily loss limit; from 09:15.
+7. **Stop** — **HA High + 0.5** (`OPTIONS_STOP_OFFSET_POINTS`): candle 2's
+   while candles 3 and 4 form, then the HA High from 2 candles back, moved at
+   every candle close.
+8. **Profit lock** — first at 5 points, then every 3 points (5, 8, 11, 14, 17 …),
+   always one step behind the best (`OPTIONS_PROFIT_LOCK_START_POINTS`,
+   `OPTIONS_PROFIT_LOCK_STEP_POINTS`). Live, it sits at the exchange. Sold at 100:
+
+   | Lowest price | Points | Buy back at | Points kept |
+   |---|---|---|---|
+   | 95 | 5 | 95 | 5 |
+   | 92 | 8 | 95 | 5 |
+   | 89 | 11 | 92 | 8 |
+   | 86 | 14 | 89 | 11 |
+   | 83 | 17 | 86 | 14 |
+9. **Exit** — stop hit, profit lock hit, or everything bought back at **15:10**
+   (`OPTIONS_SQUAREOFF_AT`).
+10. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
    (rates in `.env`, estimates — check a contract note).
 
 ## Live mode
 
-- Entry: market SELL; the exchange's actual fill price and quantity are recorded.
+- Entry: a sell stop-limit parked at the exchange at the sell price (fills the
+  moment the price gets there); the exchange's fill price and quantity are recorded.
+  The buy stop goes in right after the fill.
 - A **stop-limit BUY rests at the exchange** at whichever is closer to the price:
   the HA stop (moved every candle) or the profit lock (moved as soon as a new
   lock is set, once the price is below it). The exchange fills it the moment

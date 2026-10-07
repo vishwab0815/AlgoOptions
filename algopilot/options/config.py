@@ -6,9 +6,9 @@ OPTIONS_PAPER_TRADING=false -> LIVE: real orders on DhanHQ (see broker.py), real
 Live mode always runs with a daily loss limit (OPTIONS_MAX_DAILY_LOSS, default
 Rs 3,000) after which no new trade is opened.
 
-Entries are pure Heikin-Ashi pattern (GREEN->RED->RED) — there is no RSI
-gate, no volume gate, and no profit ratchet. The only two things that ever
-close a position are the Heikin-Ashi trailing stop and the EOD square-off.
+Entries are pure Heikin-Ashi pattern (candle 1 GREEN, candle 2 RED, sell
+during candle 3) — no RSI gate, no volume gate. A position is closed by the
+Heikin-Ashi stop, the profit lock, or the square-off — whichever comes first.
 """
 from __future__ import annotations
 
@@ -144,23 +144,28 @@ class OptionsConfig:
     official_candles: bool = True
     official_candle_wait_ms: int = 1500
 
-    # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged): once the
-    # premium is `start` points below the entry, buy back if it comes back to
-    # that level; every further `step` points down moves the lock one step
-    # behind (sold 123: touch 113 -> lock 113; 110 -> 113; 107 -> 110; ...).
     # Entry (version 2). "break": when candle 2 (RED after GREEN) closes, a
     # SELL is parked at the exchange at candle 2's HA Low minus
     # entry_offset_pts; it fills the moment candle 3's price reaches it, and is
     # cancelled if candle 3 closes first. "close": the original entry — sell
     # at candle 3's close when it broke the level.
     entry_mode: str = "break"
-    entry_offset_pts: float = 1.0
+    entry_offset_pts: float = 0.5
+    # The Heikin-Ashi stop is placed this many points ABOVE the HA High it
+    # uses (candle 2's while candles 3-4 form, then 2 candles back): HA High
+    # 100 -> buy stop at 100.50.
+    stop_offset_pts: float = 0.5
     # The parked sell is a stop-limit: once triggered it may fill down to this
     # % below the sell price (so a fast drop still fills).
     entry_limit_buffer_pct: float = 3.0
 
+    # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged). Marks at
+    # start, start+step, start+2*step ... points below the entry (5, 8, 11,
+    # 14 ...). The first mark touched locks itself; after that the lock stays
+    # one mark behind the best. Sold at 100: touch 95 -> lock 95; 92 -> still
+    # 95; 89 -> 92; 86 -> 89. Buy back when the price comes back to the lock.
     profit_lock: bool = True
-    profit_lock_start_pts: float = 10.0
+    profit_lock_start_pts: float = 5.0
     profit_lock_step_pts: float = 3.0
 
     # No new entries before this IST time (HH:MM). 09:15 = from the open
@@ -172,6 +177,10 @@ class OptionsConfig:
     # Stop the engine by itself once the market has closed (HH:MM IST, and only
     # when no position is open). "" = run until stopped by hand.
     auto_stop_at: str = "15:31"
+    # Square-off (HH:MM IST): every open trade is bought back, and no new sell
+    # order whose candle 3 would end at/after it. Must be before Dhan's own
+    # intraday auto square-off (~15:18), so 15:15 at the latest.
+    squareoff_at: str = "15:10"
 
     # Cost model applied to every paper fill — see charges.py. Defaults are
     # ESTIMATES of published Indian F&O rates and change with budgets and
@@ -195,6 +204,14 @@ class OptionsConfig:
     # conservative, with an additional 15s cool-off automatically applied
     # after any 429 (see dhan_client.py).
     chain_min_interval_secs: float = 5.0
+
+
+def _squareoff(raw: str) -> str:
+    hhmm = _hhmm(raw)
+    if not "09:20" <= hhmm <= "15:15":
+        raise OptionsConfigError(f"OPTIONS_SQUAREOFF_AT={raw!r} — use a time between 09:20 and 15:15 "
+                                 "(Dhan squares off intraday positions itself from about 15:18).")
+    return hhmm
 
 
 def _entry_mode(raw: str) -> str:
@@ -301,14 +318,16 @@ def load_options_config() -> OptionsConfig:
         official_candles=os.getenv("OPTIONS_OFFICIAL_CANDLES", "true").strip().lower() == "true",
         official_candle_wait_ms=max(0, int(os.getenv("OPTIONS_OFFICIAL_CANDLE_WAIT_MS", "1500"))),
         entry_mode=_entry_mode(os.getenv("OPTIONS_ENTRY_MODE", "break")),
-        entry_offset_pts=max(0.0, float(os.getenv("OPTIONS_ENTRY_OFFSET_POINTS", "1"))),
+        entry_offset_pts=max(0.0, float(os.getenv("OPTIONS_ENTRY_OFFSET_POINTS", "0.5"))),
+        stop_offset_pts=max(0.0, float(os.getenv("OPTIONS_STOP_OFFSET_POINTS", "0.5"))),
         entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
-        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "10"),
+        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "5"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),
         entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:15")),
         roll_on_expiry_day=os.getenv("OPTIONS_ROLL_ON_EXPIRY_DAY", "false").strip().lower() == "true",
+        squareoff_at=_squareoff(os.getenv("OPTIONS_SQUAREOFF_AT", "15:10")),
         auto_stop_at=(_hhmm(os.getenv("OPTIONS_AUTO_STOP_AT", "15:31"))
                       if os.getenv("OPTIONS_AUTO_STOP_AT", "15:31").strip() else ""),
         apply_charges=os.getenv("OPTIONS_APPLY_CHARGES", "true").strip().lower() == "true",

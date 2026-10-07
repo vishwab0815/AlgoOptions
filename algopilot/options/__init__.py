@@ -9,5 +9,5 @@ composition root (engine.py). Run it with run_options.py at the repo root.
 Floor-hundred strike band, GREEN->RED->RED Heikin-Ashi pattern sell-to-open,
 watching both legs, one position at a time, real DhanHQ margin-based lot
 sizing. Entries are pure pattern — no RSI, no volume gate. Exits: the
-Heikin-Ashi trailing stop, the profit lock, and the 15:00 IST EOD square-off.
+Heikin-Ashi trailing stop, the profit lock, and the EOD square-off (15:10 IST, OPTIONS_SQUAREOFF_AT).
 """

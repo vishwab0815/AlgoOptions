@@ -215,11 +215,12 @@ def _print_banner(config) -> None:
         f"│  {'gates':<18} pattern only — no RSI, no volume filter",
         f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open",
         f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
-        f"│  {'entries':<18} from {config.entry_start} IST, none after 15:00",
+        f"│  {'entries':<18} from {config.entry_start} IST, none after {config.squareoff_at}",
         (f"│  {'fills':<18} the exchange fills the sell at its price; buy stop placed right after the fill"
          if config.entry_mode == "break" else
          f"│  {'fills':<18} market price at signal (raw close); stop fills at the tick that hits it"),
-        f"│  {'exit':<18} stop = HA high 2 candles back (trails each close) + 15:00 square-off",
+        f"│  {'exit':<18} stop = HA high 2 candles back + {config.stop_offset_pts:g} (trails each close) "
+        f"+ {config.squareoff_at} square-off",
         (f"│  {'profit lock':<18} {config.profit_lock_start_pts:g} pts below entry, then every "
          f"{config.profit_lock_step_pts:g} pts (one step behind); buy back when it comes back"
          if config.profit_lock else f"│  {'profit lock':<18} off"),

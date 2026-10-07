@@ -9,7 +9,7 @@ Pre-open session (09:00–09:15) is deliberately excluded — prices are not
 reliable during the call auction phase.
 
 New ENTRIES are additionally gated out of two narrower windows inside the
-main session: 09:15-09:30 (post-open settle buffer) and 15:00-15:30 (our
+main session: 09:15-09:30 (post-open settle buffer) and 15:10-15:30 (our
 own pre-close EOD square-off buffer, ahead of Dhan's own ~15:18-15:19 RMS
 auto square-off — see should_square_off_now()). EXITS are never gated by
 either of these — an open position must always be closeable.
@@ -51,7 +51,19 @@ _ALGO_START_TIME = time(9, 30)  # 09:30 IST
 # price we choose via our own market order, not Dhan's RMS — and stops
 # opening brand-new positions from the same cutoff, so nothing we open this
 # late ever gets caught by our own square-off on its very next tick.
-_EOD_SQUAREOFF_TIME = time(15, 0)  # 03:00 IST — every position is flat by the 3 PM bell
+_EOD_SQUAREOFF_TIME = time(15, 10)  # default; the engine sets it from OPTIONS_SQUAREOFF_AT
+
+
+def set_squareoff_time(hhmm: str) -> None:
+    """The square-off time (HH:MM IST): from then on no new entries, and every
+    open position is bought back. Set once by the engine from the config."""
+    global _EOD_SQUAREOFF_TIME
+    h, m = (int(x) for x in hhmm.split(":"))
+    _EOD_SQUAREOFF_TIME = time(h, m)
+
+
+def squareoff_time() -> str:
+    return _EOD_SQUAREOFF_TIME.strftime("%H:%M")
 
 # Weekdays: Monday=0 … Friday=4
 _TRADING_DAYS = {0, 1, 2, 3, 4}
@@ -71,12 +83,12 @@ class MarketStatus:
     ist_time: str           # Human-readable current IST time
     reason: str             # Explanation for the current state
     is_trading_allowed: bool  # True only when state == OPEN
-    # True only in the 09:30-15:00 IST window — past the post-open settle
+    # True only in the 09:30-square-off (15:10) IST window — past the post-open settle
     # buffer AND before the pre-close EOD square-off window. New entries are
     # gated on this; existing positions are never gated on it (an exit must
     # always be allowed regardless of this flag).
     algo_trading_allowed: bool = False
-    eod_squareoff_due: bool = False  # True from 15:00 IST — see should_square_off_now()
+    eod_squareoff_due: bool = False  # True from the square-off time (15:10) — see should_square_off_now()
 
 
 class MarketClosedError(RuntimeError):
@@ -129,7 +141,7 @@ def get_market_status(now: datetime | None = None) -> MarketStatus:
         algo_allowed = (current_time >= _ALGO_START_TIME) and not squareoff_due
         if squareoff_due:
             reason = (
-                "EOD square-off window (from 15:00 IST) — no new entries; "
+                f"EOD square-off window (from {squareoff_time()} IST) — no new entries; "
                 "any open position is being closed before Dhan's own 15:18-15:19 RMS cutoff."
             )
         elif algo_allowed:
@@ -174,7 +186,7 @@ def is_market_open(now: datetime | None = None) -> bool:
 
 def should_square_off_now(now: datetime | None = None) -> bool:
     """
-    True from 15:00 IST (our own hard cutoff) through real market close — the
+    True from the square-off time (15:10 IST, our own hard cutoff) through real market close — the
     window in which any still-open position should be force-closed by US,
     at a price we choose, rather than left for DhanHQ's RMS to square off.
 
@@ -234,7 +246,7 @@ def assert_algo_trading_allowed(now: datetime | None = None) -> None:
     """
     Raise MarketClosedError if the market is closed, we're still inside the
     post-open settle window (09:15-09:30 IST), or we're inside the pre-close
-    EOD square-off window (from 15:00 IST — see should_square_off_now()).
+    EOD square-off window (from the square-off time — see should_square_off_now()).
     Call this alongside assert_market_open() before executing any NEW ENTRY
     — it does not replace it, and it must never be used to gate an exit;
     closing an existing position has to remain allowed at any time.
