@@ -356,7 +356,7 @@ class OptionsDhanClient:
 
     def margin_per_lot(
         self, security_id: Optional[str], exchange_segment: str, price: float,
-        lot_size: int, fallback: float,
+        lot_size: int, fallback: float, force: bool = False,
     ) -> Tuple[float, bool]:
         """Returns (per_lot_margin, is_live). is_live=False means `fallback`
         was used because the option's security id isn't known yet or the
@@ -366,7 +366,7 @@ class OptionsDhanClient:
             return fallback, False
 
         cached = self._margin_cache.get(security_id)
-        if cached is not None and (time.monotonic() - cached[1]) < _MARGIN_TTL_SECS:
+        if not force and cached is not None and (time.monotonic() - cached[1]) < _MARGIN_TTL_SECS:
             return cached[0], True
 
         try:
@@ -406,19 +406,20 @@ class OptionsDhanClient:
 
     async def margin_per_lot_async(
         self, security_id: Optional[str], exchange_segment: str, price: float,
-        lot_size: int, fallback: float,
+        lot_size: int, fallback: float, force: bool = False,
     ) -> Tuple[float, bool]:
         """Non-blocking wrapper. LATENCY: a cached figure is returned inline —
         this sits on the entry path the instant a candle closes, and even a
         thread-pool hop costs time there. Only a cache miss goes to a thread
         (token-bucket wait + HTTP), and the engine pre-fetches in the
-        background so that miss never lands at the trigger."""
-        if security_id and price > 0:
+        background so that miss never lands at the trigger. force=True skips
+        the cache (the background refresh); a failed refresh keeps the old figure."""
+        if not force and security_id and price > 0:
             cached = self._margin_cache.get(security_id)
             if cached is not None and (time.monotonic() - cached[1]) < _MARGIN_TTL_SECS:
                 return cached[0], True
         return await asyncio.to_thread(
-            self.margin_per_lot, security_id, exchange_segment, price, lot_size, fallback
+            self.margin_per_lot, security_id, exchange_segment, price, lot_size, fallback, force
         )
 
     def margin_cache_age(self, security_id: Optional[str]) -> Optional[float]:

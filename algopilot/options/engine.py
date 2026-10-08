@@ -58,7 +58,7 @@ from zoneinfo import ZoneInfo
 from ..core.candle_builder import Candle, CandleBuilder
 from ..core.heikin_ashi import HeikinAshiEngine
 from ..strategy.direction import SHORT
-from ..strategy.signal_engine import SignalEngine
+from ..strategy.signal_engine import SignalEngine, StrategyDecision
 from ..utils.market_hours import get_market_status, set_squareoff_time
 from .config import OptionsConfig
 from .dhan_client import OptionsDhanClient
@@ -85,6 +85,34 @@ def resolve_band(spot: float) -> tuple:
     return put_strike, put_strike + 100.0
 
 
+def pick_strike(chain, side: str, low: float, high: float, step: int) -> Optional[Tuple[float, float, bool]]:
+    """(strike, premium, in range) for one side from the option chain, or None.
+
+    Only OUT-OF-THE-MONEY strikes on the `step` grid count (PE below spot, CE
+    above). Of those with a premium between `low` and `high`, the FARTHEST one
+    wins — the cheapest still >= `low`. If none is in range, the one whose
+    premium is closest to the range. NIFTY 22,233: PE 22200 Rs 165, 22100 Rs 128,
+    22000 Rs 104, 21900 Rs 82 -> PE 22000; CE 22300 Rs 170, 22400 Rs 135,
+    22500 Rs 106, 22600 Rs 84 -> CE 22500."""
+    key = side.lower()
+    otm = []
+    for strike, quotes in (chain.legs or {}).items():
+        q = (quotes or {}).get(key)
+        price = getattr(q, "last_price", 0.0) or 0.0
+        on_grid = abs(strike / step - round(strike / step)) < 1e-6
+        beyond = strike < chain.spot if side == "PE" else strike > chain.spot
+        if price > 0 and on_grid and beyond:
+            otm.append((float(strike), float(price)))
+    if not otm:
+        return None
+    inside = [(k, p) for k, p in otm if low <= p <= high]
+    if inside:
+        k, p = min(inside, key=lambda x: x[1])            # the farthest = the cheapest in range
+        return k, p, True
+    k, p = min(otm, key=lambda x: ((low - x[1]) if x[1] < low else (x[1] - high), x[1]))   # a tie: the farther one
+    return k, p, False
+
+
 # How far past a hundred-boundary spot must travel before an ALREADY-SET band
 # moves (see _maybe_resolve_band). Spot parked at 23400.0x would otherwise
 # flip the band on every poll, and a band change resets both legs' pattern
@@ -98,10 +126,9 @@ _BAND_HYSTERESIS_POINTS = 15.0
 # miss measured was 0.03 ms. Cost: ~60 ms of spinning per 5-minute candle.
 _CLOCK_SPIN_SECS = 0.060
 
-# Live: warm the order connection this long before each candle close if it
-# hasn't been used for _WARM_IF_IDLE_SECS (Dhan keeps an idle one open >100 s).
+# This long before each candle close, everything an entry needs is made ready
+# (see _warm_up): funds read, both candle-data connections used, margins fresh.
 _WARM_BEFORE_SECS = 2.0
-_WARM_IF_IDLE_SECS = 20.0
 
 # Calendar days of earlier sessions fetched to continue the Heikin-Ashi series
 # (see _backfill_leg). 5 covers a weekend plus a holiday; one full session is
@@ -126,6 +153,12 @@ STOP_FILE = Path("data/STOP")
 
 # Live mode: how often the broker's available funds are re-read (seconds).
 _FUNDS_REFRESH_SECS = 60.0
+# Right after our own trade exits or our own sell order is cancelled, Dhan frees
+# that margin a moment later. If a fresh read still can't cover 1 lot within
+# this many seconds of such a release, read again (up to N times, this far apart).
+_FUNDS_RELEASE_WINDOW_SECS = 5.0
+_FUNDS_RETRIES = 3
+_FUNDS_RETRY_GAP_SECS = 0.3
 
 # Live mode: how often an open position is checked against Dhan's positions,
 # to notice a position closed OUTSIDE the engine (by hand in the Dhan app).
@@ -281,6 +314,13 @@ class OptionsEngine:
         )
         self._broker_funds: Optional[float] = None
         self._funds_checked_at = 0.0
+        # The funds figure goes stale the moment our own fill / exit / cancel
+        # changes what Dhan holds back; the next entry then reads it fresh.
+        self._funds_stale = True
+        self._funds_gen = 0          # bumped on every change: a read begun before one doesn't count
+        self._released_at = 0.0      # when our last exit / cancel freed margin (monotonic)
+        # How long DhanHQ took to give each side's last candle (ms) — shown on the SELL ORDER line.
+        self._bar_ms: Dict[str, float] = {}
         self._positions_checked_at = 0.0
         # Contracts where Dhan's position differs from the engine's (manual
         # trades etc.) — re-checked every few seconds, see _check_foreign_positions.
@@ -339,7 +379,7 @@ class OptionsEngine:
         legs, the fill was then attached to the discarded old leg, and the
         engine lost a real short: no trailing stop, no square-off buy-back, not in
         saved state (reproduced in a test before this fix)."""
-        return (self._entry_in_flight is not None or self._armed is not None
+        return (self._entry_in_flight is not None or self._armed is not None or self._waiting is not None
                 or any(leg.position is not None for leg in self.legs.values()))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -463,14 +503,10 @@ class OptionsEngine:
         while self._running:
             boundary = (time.time() // tf + 1) * tf
             target = boundary + grace
-            if self.broker is not None:
-                # Make sure the HTTPS connection to Dhan's order server is OPEN
-                # when the order goes out: a fresh connection measured 327 ms,
-                # an open one 39 ms. The 5 s position check normally keeps it
-                # open; this covers the case where that has been quiet.
-                await asyncio.sleep(max(0.0, boundary - _WARM_BEFORE_SECS - time.time()))
-                if time.monotonic() - self.broker.last_call_at > _WARM_IF_IDLE_SECS:
-                    self._spawn(self.broker.keep_warm_async())
+            # Get everything an entry needs ready BEFORE the close: a fresh
+            # HTTPS connection measured 327 ms, an open one 39 ms.
+            await asyncio.sleep(max(0.0, boundary - _WARM_BEFORE_SECS - time.time()))
+            self._spawn(self._warm_up(boundary))
             await asyncio.sleep(max(0.0, target - time.time() - _CLOCK_SPIN_SECS))
             while time.time() < target:
                 await asyncio.sleep(0)       # yields, so ticks keep flowing while we wait
@@ -478,6 +514,30 @@ class OptionsEngine:
                 await self._close_candles_at(datetime.fromtimestamp(boundary, tz=timezone.utc))
             except Exception:
                 logger.exception("Candle clock: closing candles at the boundary failed.")
+
+    async def _warm_up(self, boundary: float) -> None:
+        """2 s before each candle close (08-Oct: orders went in +200 to +500 ms
+        after the close). All at once, in the background:
+          - live: read the funds (keeps the order connection open AND gives a
+            fresh figure for the entry — the old keep-warm threw it away);
+          - one candle request per leg, at the same time, so BOTH connections
+            the two candle fetches at the close will use are already open;
+          - refresh a margin figure that is getting old (never fetched at the close)."""
+        jobs = []
+        if self.broker is not None:
+            jobs.append(self._read_funds())
+        tf = self.config.candle_timeframe_secs
+        frm = datetime.fromtimestamp(boundary - 2 * tf, tz=timezone.utc).astimezone(_IST)
+        to = datetime.fromtimestamp(boundary, tz=timezone.utc).astimezone(_IST)
+        for leg in self.legs.values():
+            if leg.security_id:
+                jobs.append(self.client.get_intraday_candles_async(
+                    leg.security_id, self.config.option_exchange_segment, "OPTIDX", max(1, tf // 60),
+                    f"{frm:%Y-%m-%d %H:%M:%S}", f"{to:%Y-%m-%d %H:%M:%S}"))
+        jobs.append(self._prefetch_margins(None))
+        for r in await asyncio.gather(*jobs, return_exceptions=True):
+            if isinstance(r, Exception):
+                logger.debug("warm-up before the candle close: %s", r)
 
     async def _close_candles_at(self, boundary: datetime) -> None:
         mkt = get_market_status(now=boundary)
@@ -746,12 +806,7 @@ class OptionsEngine:
                 {"open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]}
             )
             old_stage, old_target = leg.setup_stage, leg.target_level
-            color = "GREEN" if float(row["ha_close"]) > float(row["ha_open"]) else "RED"
-            decision, new_level, new_stage = _SIGNAL_ENGINE.evaluate_breakout(
-                ha_open=float(row["ha_open"]), ha_high=float(row["ha_high"]),
-                ha_close=float(row["ha_close"]), ha_low=float(row["ha_low"]),
-                target_breakout_level=leg.target_level, setup_stage=leg.setup_stage, rules=SHORT,
-            )
+            color, decision, new_level, new_stage = self._pattern_step(leg, row)
             leg.target_level = new_level
             leg.setup_stage = new_stage
 
@@ -814,9 +869,7 @@ class OptionsEngine:
             await self._poll_live_stops()
             if time.monotonic() - self._funds_checked_at > _FUNDS_REFRESH_SECS:
                 self._funds_checked_at = time.monotonic()
-                funds = await self.broker.funds_async()
-                if funds is not None:
-                    self._broker_funds = funds
+                await self._read_funds()
 
         # Close any candle whose timeframe has elapsed (quiet strike, feed
         # gap, or simply no tick yet after the boundary). Done FIRST: the
@@ -846,7 +899,10 @@ class OptionsEngine:
                         # derive the strike band from it — never the reverse.
                         logger.info("NIFTY 50 spot = %.2f", chain.spot)
                     before = (self.put_strike, self.call_strike)
-                    self._maybe_resolve_band(chain.spot)
+                    if self.config.strike_pick == "premium":
+                        self._maybe_pick_strikes(chain)
+                    else:
+                        self._maybe_resolve_band(chain.spot)
                     # BUG FIXED: this used to re-subscribe ONLY on the very
                     # first resolution (band_was_unset) — any LATER band
                     # change (a legitimate mid-day shift, or spot chopping
@@ -876,7 +932,11 @@ class OptionsEngine:
     async def _prefetch_margins(self, chain) -> None:
         """LATENCY: keep each flat leg's margin figure fresh in the background,
         so the entry at a candle close never waits on the margin calculator
-        (50-300 ms over the network on a cache miss, every 15 minutes)."""
+        (50-300 ms over the network on a cache miss, every 15 minutes).
+        BUG FIXED: the refresh at 10 minutes asked through the cache, which
+        still answered for 5 more minutes — so nothing was refreshed until the
+        figure had EXPIRED, and an entry landing then fetched it at the close
+        (likely 08-Oct 10:50, +508 ms). Now the refresh skips the cache."""
         for side in _LEGS:
             leg = self.legs[side]
             if leg.position is not None or not leg.security_id or leg.strike is None:
@@ -884,12 +944,12 @@ class OptionsEngine:
             age = self.client.margin_cache_age(leg.security_id)
             if age is not None and age < _MARGIN_REFRESH_SECS:
                 continue
-            quote = ((chain.legs or {}).get(leg.strike) or {}).get(side.lower())
+            quote = ((chain.legs or {}).get(leg.strike) or {}).get(side.lower()) if chain is not None else None
             price = getattr(quote, "last_price", 0.0) or self._last_premium.get(side, 0.0)
             if price > 0:
                 await self.client.margin_per_lot_async(
                     leg.security_id, self.config.option_exchange_segment, price,
-                    leg.lot_size or self.config.lot_size, self.config.fallback_margin_per_lot,
+                    leg.lot_size or self.config.lot_size, self.config.fallback_margin_per_lot, force=True,
                 )
 
     def _check_exits_from_chain(self, chain, squareoff_due: bool, now: datetime) -> None:
@@ -1101,6 +1161,57 @@ class OptionsEngine:
         # A genuinely different contract per leg — candle/pattern history resets.
         self.legs = {side: self._new_leg(side) for side in _LEGS}
 
+    def _maybe_pick_strikes(self, chain) -> None:
+        """OPTIONS_STRIKE_PICK=premium (08-Oct, approved): each side trades an
+        out-of-the-money strike whose premium is in OPTIONS_PREMIUM_MIN..MAX —
+        the farthest one (see pick_strike).
+
+        - Never while anything is open or waiting (band_frozen): a trade stays
+          on its strike to the end even if its premium leaves the range — the
+          range only chooses the strike for the NEXT trade.
+        - A side keeps its strike while the premium is within the range +/-
+          OPTIONS_PREMIUM_BUFFER (95-155) and the strike is still out of the
+          money — no switching back and forth on every tick around 100.
+        - No strike in range: a side keeps a strike it already has (if still out
+          of the money); otherwise it takes the closest one, with a warning.
+        - A side that switches starts fresh on the new contract (history
+          rebuilt, new pattern); the other side keeps its pattern."""
+        if self.band_frozen:
+            return
+        cfg = self.config
+        lo, hi, buf = cfg.premium_min, cfg.premium_max, cfg.premium_buffer
+        new, notes = {}, []
+        for side in _LEGS:
+            cur = self.call_strike if side == "CE" else self.put_strike
+            q = ((chain.legs or {}).get(cur) or {}).get(side.lower()) if cur is not None else None
+            price = getattr(q, "last_price", 0.0) or 0.0
+            otm = cur is not None and (cur < chain.spot if side == "PE" else cur > chain.spot)
+            if otm and (price <= 0 or lo - buf <= price <= hi + buf):
+                new[side] = cur                       # still fits (or no price this poll): keep it
+                continue
+            pick = pick_strike(chain, side, lo, hi, cfg.strike_step)
+            if pick is None:
+                new[side] = cur
+                continue
+            strike, prem, inside = pick
+            if not inside and otm:
+                new[side] = cur                       # nothing better in range: keep what it has
+                continue
+            new[side] = strike
+            if strike != cur:
+                notes.append(f"{side} {strike:.0f} (Rs {prem:.2f}{'' if inside else ', NOT in range'})")
+                if not inside:
+                    logger.warning("[%-2s] no out-of-the-money strike has a premium of Rs %g-%g — using %.0f "
+                                   "(Rs %.2f), the closest.", side, lo, hi, strike, prem)
+        if new["PE"] == self.put_strike and new["CE"] == self.call_strike:
+            return
+        logger.info("Strikes picked by premium (OTM, Rs %g-%g, farthest): %s | spot %.2f",
+                    lo, hi, " / ".join(notes), chain.spot)
+        changed = [s for s in _LEGS if new[s] != (self.call_strike if s == "CE" else self.put_strike)]
+        self.put_strike, self.call_strike = new["PE"], new["CE"]
+        for side in changed:                          # a new contract: its own history, a fresh pattern
+            self.legs[side] = self._new_leg(side)
+
     async def _ensure_contract_async(self, side: str, leg: LegState) -> None:
         """The first call may trigger a scrip-master CSV download (up to
         60s) — runs off the event loop (see dhan_client.py) so it never
@@ -1164,6 +1275,9 @@ class OptionsEngine:
                 logger.info("%s || 3/3 TRIGGER — broke %.2f (history only, not traded)", base, level)
             else:
                 logger.info("%s || 3/3 TRIGGER — broke %.2f, signal", base, level)
+        elif color == "DOJI" and old_stage != SignalEngine.STAGE_LEVEL_SET:
+            waiting = {SignalEngine.STAGE_GREEN_SEEN: "still 1/3, watch for RED"}.get(old_stage, "waiting for GREEN")
+            logger.info("%s || DOJI        — skipped, %s", base, waiting)
         elif new_stage == SignalEngine.STAGE_GREEN_SEEN:
             logger.info("%s || 1/3 ARMED   — GREEN start, watch for RED", base)
         elif new_stage == SignalEngine.STAGE_LEVEL_SET:
@@ -1183,6 +1297,43 @@ class OptionsEngine:
             stage_before=old_stage, stage_after=new_stage, target_level=new_target,
             signal=decision.signal or "NONE",
         )
+
+    def _is_doji(self, ha_open: float, ha_high: float, ha_low: float, ha_close: float) -> bool:
+        """HA body at most OPTIONS_DOJI_BODY_PCT % of the candle's height (the "+" candle)."""
+        pct = self.config.doji_body_pct
+        if pct <= 0:
+            return False
+        height = ha_high - ha_low
+        return abs(ha_close - ha_open) <= height * pct / 100.0 + 1e-9
+
+    def _pattern_step(self, leg: LegState, row) -> Tuple[str, StrategyDecision, Optional[float], str]:
+        """One candle through the GREEN -> RED pattern: (colour, decision, level, stage).
+
+        Doji (08-Oct, approved): a candle with almost no body is neither GREEN
+        nor RED. 07-Oct 14:35 CE 22700 closed 0.46 below its open (4.8% of its
+        height) and became candle 2; candle 3 missed its sell price by 1 point
+        and the 104 -> 90 fall after it was never traded.
+          - waiting for candle 1 or candle 2: the doji is skipped — the pattern
+            stays exactly where it was (GREEN, doji, RED -> the RED is candle 2);
+          - as candle 3: judged as usual (the sell order lives for that candle
+            whatever its colour), but it can't start a new pattern.
+        The HA stop is not affected: a doji is still a candle for "2 back"."""
+        o, h, l, c = (float(row[k]) for k in ("ha_open", "ha_high", "ha_low", "ha_close"))
+        if self._is_doji(o, h, l, c):
+            if leg.setup_stage != SignalEngine.STAGE_LEVEL_SET:
+                pct = 100.0 * abs(c - o) / (h - l) if h > l else 0.0
+                return "DOJI", StrategyDecision(signal=None, trend="Neutral", strength="Weak",
+                                                reason=f"Doji (body {pct:.1f}% of height) - skipped."), \
+                    leg.target_level, leg.setup_stage
+            o = max(o, c)                    # never a starter: candle 3 is only broke / held
+            color = "DOJI"
+        else:
+            color = "GREEN" if c > o else "RED"
+        decision, level, stage = _SIGNAL_ENGINE.evaluate_breakout(
+            ha_open=o, ha_high=h, ha_close=c, ha_low=l,
+            target_breakout_level=leg.target_level, setup_stage=leg.setup_stage, rules=SHORT,
+        )
+        return color, decision, level, stage
 
     async def _on_candle_close(self, side: str, leg: LegState, candle: Candle, squareoff_due: bool,
                                finalized: bool = False, arm_now: bool = True) -> None:
@@ -1208,17 +1359,10 @@ class OptionsEngine:
                     await self._sync_protective_stop(side, leg)
 
         old_stage, old_target = leg.setup_stage, leg.target_level
-        is_bullish = float(ha_row["ha_close"]) > float(ha_row["ha_open"])
-        color = "GREEN" if is_bullish else "RED"
-
-        decision, new_level, new_stage = _SIGNAL_ENGINE.evaluate_breakout(
-            ha_open=float(ha_row["ha_open"]), ha_high=float(ha_row["ha_high"]),
-            ha_close=float(ha_row["ha_close"]), ha_low=float(ha_row["ha_low"]),
-            target_breakout_level=leg.target_level, setup_stage=leg.setup_stage, rules=SHORT,
-        )
+        color, decision, new_level, new_stage = self._pattern_step(leg, ha_row)
         leg.target_level = new_level
         leg.setup_stage = new_stage
-        if is_bullish:
+        if color == "GREEN":
             leg.starter_end = candle.end_ts
 
         # Always logged, both legs, every close — the locked-out side's
@@ -1358,14 +1502,62 @@ class OptionsEngine:
         for side, (leg, candle, level, high, window) in ready.items():
             await self._arm(side, leg, candle, level, high, window)
 
+    # ── Funds (live) ─────────────────────────────────────────────────────────
+
+    def _funds_changed(self, released: bool = False) -> None:
+        """Our own fill / exit / cancel changed the margin Dhan holds back, so
+        the remembered funds figure is no longer right."""
+        self._funds_stale = True
+        self._funds_gen += 1
+        if released:
+            self._released_at = time.monotonic()
+
+    async def _read_funds(self) -> Optional[float]:
+        """Ask Dhan for the available funds now, and remember them."""
+        gen = self._funds_gen
+        funds = await self.broker.funds_async()
+        if funds is not None:
+            self._broker_funds, self._funds_checked_at = funds, time.monotonic()
+            if gen == self._funds_gen:          # nothing of ours changed during the read
+                self._funds_stale = False
+        return funds
+
+    async def _funds_for_entry(self, per_lot: float) -> Optional[float]:
+        """The funds to size a live entry on.
+
+        BUG FIXED (08-Oct 11:13, 11:25, 11:55): funds were re-read only every
+        60 s. Right after our own trade exited, or our own sell order was
+        cancelled, the engine still used a figure read while Dhan held ~Rs 1.5
+        lakh back for it — "funds can't cover 1 lot" with Rs 2 lakh in the
+        account, 1-4 ms after the release. Now a stale figure is read again
+        first, and if Dhan hasn't freed the margin yet it is re-read a few times."""
+        if self.broker is None:
+            return None
+        if self._funds_stale or time.monotonic() - self._funds_checked_at > _FUNDS_REFRESH_SECS:
+            await self._read_funds()
+            tries = 0
+            while (tries < _FUNDS_RETRIES and per_lot > 0 and self._broker_funds is not None
+                   and self._broker_funds < per_lot
+                   and time.monotonic() - self._released_at < _FUNDS_RELEASE_WINDOW_SECS):
+                tries += 1
+                await asyncio.sleep(_FUNDS_RETRY_GAP_SECS)
+                await self._read_funds()
+        return self._broker_funds
+
+    def _funds_note(self) -> str:
+        if self.broker is not None and self._broker_funds is not None:
+            return f"funds Rs {self._broker_funds:.0f}"
+        return f"balance Rs {self.balance:.0f}"
+
     async def _size_entry(self, side: str, leg: LegState, price: float) -> Tuple[int, int, float, bool]:
         """(lots, qty, margin per lot, margin is live) — the same sizing as _enter."""
         lot_size = leg.lot_size or self.config.lot_size
         per_lot, is_live = await self.client.margin_per_lot_async(
             leg.security_id, self.config.option_exchange_segment, price, lot_size, self.config.fallback_margin_per_lot)
         capital = self.balance
-        if self.broker is not None and self._broker_funds is not None:
-            capital = min(capital, self._broker_funds)
+        funds = await self._funds_for_entry(per_lot)
+        if funds is not None:
+            capital = min(capital, funds)
         lots = math.floor(capital / self.config.max_concurrent / per_lot) if per_lot > 0 else 0
         lots = min(lots, self.config.max_lots_per_trade)
         if self.broker is not None:
@@ -1374,6 +1566,7 @@ class OptionsEngine:
 
     async def _arm(self, side: str, leg: LegState, candle2: Candle, level: float, high: float, window: str) -> None:
         """Candle 2 closed: park the SELL for candle 3."""
+        t0 = time.monotonic()
         tf = timedelta(seconds=self.config.candle_timeframe_secs)
         trigger = self._sell_price_for(level)
         stop = high + self.config.stop_offset_pts       # candle 2's HA High + the stop offset
@@ -1384,9 +1577,10 @@ class OptionsEngine:
                 return
             if lots < 1:
                 self.ledger.log_event("BLOCKED_MARGIN", symbol=side,
-                                      details=f"per_lot_margin={per_lot:.0f} live={margin_live} balance={self.balance:.0f}")
-                logger.warning("[%-2s] %s: no sell order — funds can't cover 1 lot (margin/lot Rs %.0f).",
-                               side, window, per_lot)
+                                      details=f"per_lot_margin={per_lot:.0f} live={margin_live} "
+                                              f"balance={self.balance:.0f} funds={self._broker_funds}")
+                logger.warning("[%-2s] %s: no sell order — %s can't cover 1 lot (margin/lot Rs %.0f).",
+                               side, window, self._funds_note(), per_lot)
                 return
             a = ArmedEntry(side, leg, level, trigger, stop, window, candle2.end_ts, candle2.end_ts + tf,
                            lots, qty, per_lot, margin_live)
@@ -1425,10 +1619,15 @@ class OptionsEngine:
             a.order_id = order_id
             self._armed = a
             self._save_state()
+            sent_ms = (time.monotonic() - t0) * 1000.0
+            bar_ms = self._bar_ms.get(side)
+            at_close = (datetime.now(timezone.utc) - candle2.end_ts).total_seconds() < 5.0
+            timing = (f" (candle from DhanHQ {bar_ms:.0f} ms + order sent in {sent_ms:.0f} ms)"
+                      if at_close and bar_ms is not None else f" (order sent in {sent_ms:.0f} ms)")
             logger.info("[%-2s] SELL ORDER %5.0f | x%d parked AT THE EXCHANGE: trigger %.2f limit %.2f "
-                        "(candle 2 HA Low %.2f − %g) for %s | stop %.2f | order %s%s",
+                        "(candle 2 HA Low %.2f − %g) for %s | stop %.2f | order %s%s%s",
                         side, leg.strike or 0, qty, trigger, limit, level, self.config.entry_offset_pts,
-                        window, stop, order_id, _decided_after(candle2.end_ts))
+                        window, stop, order_id, _decided_after(candle2.end_ts), timing)
             self.ledger.log_event("ENTRY_ARMED", symbol=side,
                                   details=f"window={window} sell={trigger:.2f} limit={limit:.2f} level={level:.2f} "
                                           f"stop={stop:.2f} qty={qty} order={order_id}")
@@ -1496,6 +1695,7 @@ class OptionsEngine:
                                     cover_level=a.stop, entry_time=at_time)
         if self.broker is not None:
             self._last_fill_at[str(leg.security_id)] = time.monotonic()
+            self._funds_changed()
         lot_size = leg.lot_size or self.config.lot_size
         self.ledger.record_entry(
             ("ENTRY", side,
@@ -1632,6 +1832,7 @@ class OptionsEngine:
                 return
             ok, msg = await self.broker.cancel_async(a.order_id)
             st = await self._settled_status(a.order_id)
+            self._funds_changed(released=True)          # Dhan frees the margin it held for this order
             if st.filled_qty > 0:
                 booked = self._book_entry_fill(a, st.avg_price or a.trigger, min(st.filled_qty, a.qty), a.order_id,
                                                datetime.now(timezone.utc), f"LIVE order {a.order_id}")
@@ -1765,8 +1966,11 @@ class OptionsEngine:
             return candle
         max_wait = _PARTIAL_FETCH_MAX_SECS if partial else self.config.official_candle_wait_ms / 1000.0
         t0 = time.monotonic()
+        self._bar_ms.pop(side, None)
         bar = await self._fetch_bar(leg, candle, max_wait)
         took_ms = (time.monotonic() - t0) * 1000.0
+        if bar is not None:
+            self._bar_ms[side] = took_ms
         if leg is not self.legs.get(side):
             # Strikes changed while the bar was being fetched: the old strike's
             # signal must not be traded after the engine left it.
@@ -1880,9 +2084,9 @@ class OptionsEngine:
             logger.warning("[%-2s] signal dropped: strikes changed before the order could be sent.", side)
             return
         capital = self.balance
-        if self.broker is not None and self._broker_funds is not None:
-            # Never size beyond what the account actually has free.
-            capital = min(capital, self._broker_funds)
+        funds = await self._funds_for_entry(per_lot_margin)     # never size beyond what the account has free
+        if funds is not None:
+            capital = min(capital, funds)
         lots = 0
         if per_lot_margin > 0:
             lots = math.floor(capital / self.config.max_concurrent / per_lot_margin)
@@ -1895,8 +2099,8 @@ class OptionsEngine:
                 details=f"per_lot_margin={per_lot_margin:.0f} live={is_live} balance={self.balance:.0f}",
             )
             logger.warning(
-                "[%s] entry blocked — balance=Rs %.0f cannot afford 1 lot at margin/lot=Rs %.0f.",
-                side, self.balance, per_lot_margin,
+                "[%s] entry blocked — %s cannot afford 1 lot at margin/lot=Rs %.0f.",
+                side, self._funds_note(), per_lot_margin,
             )
             return
 
@@ -1966,6 +2170,7 @@ class OptionsEngine:
         res = await self.broker.wait_for_fill(order_id, exact=(txn == "BUY"))
         if res.filled_qty > 0:
             self._last_fill_at[leg.security_id] = time.monotonic()
+            self._funds_changed(released=(txn == "BUY"))
         self.ledger.log_event("ORDER_RESULT", symbol=side,
                               details=f"{txn} order={order_id} status={res.status} filled={res.filled_qty} "
                                       f"avg={res.avg_price:.2f} {res.message}")
@@ -2262,6 +2467,10 @@ class OptionsEngine:
                     foreign.add(sec)
                 continue
             if net != mine.get(sec, 0):
+                if await self._own_exit_filled(sec):
+                    # Our own exchange stop / buy-back just filled and isn't
+                    # booked yet — the stop check right after books it.
+                    continue
                 foreign.add(sec)
                 if sec not in self._foreign_contracts:
                     ours = mine.get(sec, 0)
@@ -2271,6 +2480,23 @@ class OptionsEngine:
                         "check the Dhan app.", net, sec, names.get(sec, "?"), ours)
                     self.ledger.log_event("FOREIGN_POSITION", details=f"security={sec} dhan_net={net} engine={ours}")
         self._foreign_contracts = foreign
+
+    async def _own_exit_filled(self, sec: str) -> bool:
+        """True when Dhan shows our short gone because OUR OWN exit already
+        happened there: the exchange stop filled, or a buy-back is in flight.
+        BUG FIXED (08-Oct 10:56:02): the stop had filled at Dhan a moment
+        before the engine heard; the position check ran first and raised
+        "a position the engine didn't open" — booked normally 1 s later."""
+        for leg in self.legs.values():
+            pos = leg.position
+            if pos is None or str(leg.security_id) != sec:
+                continue
+            if pos.closing or pos.exit_pending:
+                return True
+            if pos.stop_order_id:
+                st = await self.broker.status_async(pos.stop_order_id)
+                return st.status == "TRADED" or st.filled_qty > 0
+        return False
 
     async def _poll_live_stops(self) -> None:
         """Once a second: did an exchange stop fill? Did one vanish? Does a
@@ -2431,9 +2657,8 @@ class OptionsEngine:
                 self._blocked_contracts.add(sec)
                 logger.critical("Dhan shows an open NSE_FNO position the engine didn't open (security %s, "
                                 "net %d). The engine will not trade that contract.", sec, net)
-        funds = await self.broker.funds_async()
+        funds = await self._read_funds()
         if funds is not None:
-            self._broker_funds, self._funds_checked_at = funds, time.monotonic()
             logger.info("Dhan available funds: Rs %.2f", funds)
 
     async def _kill_switch(self) -> None:
@@ -2566,6 +2791,8 @@ class OptionsEngine:
             f"day net Rs {self.realized_pnl:+.2f}" if self.broker is not None else f"bal Rs {self.balance:11.2f}",
         )
 
+        if self.broker is not None:
+            self._funds_changed(released=True)          # Dhan frees the margin it held for this short
         if partial:
             pos.qty -= closed
             logger.critical("[%-2s] PARTIAL close: %d still open — the engine keeps managing it.", side, pos.qty)

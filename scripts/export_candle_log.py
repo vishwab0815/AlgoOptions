@@ -83,7 +83,8 @@ def main() -> int:
         if not leg_rows:
             continue
         greens = sum(1 for r in leg_rows if r["color"] == "GREEN")
-        reds = len(leg_rows) - greens
+        dojis = sum(1 for r in leg_rows if r["color"] == "DOJI")
+        reds = len(leg_rows) - greens - dojis
         armed = sum(1 for r in leg_rows if r["stage_after"] == "GREEN_SEEN")
         set_ = sum(1 for r in leg_rows if r["stage_after"] == "LEVEL_SET")
         triggered = sum(1 for r in leg_rows if r["signal"] == "SELL")
@@ -92,7 +93,7 @@ def main() -> int:
         conv = (triggered / set_ * 100.0) if set_ else 0.0
         print(
             f"  {leg}: {len(leg_rows)} candles ({live_n} live, {backfill_n} backfill) | "
-            f"{greens} GREEN / {reds} RED | 1/3 armed {armed}x -> 2/3 set {set_}x -> "
+            f"{greens} GREEN / {reds} RED / {dojis} DOJI | 1/3 armed {armed}x -> 2/3 set {set_}x -> "
             f"3/3 triggered {triggered}x  (set->trigger conversion {conv:.0f}%)"
         )
 

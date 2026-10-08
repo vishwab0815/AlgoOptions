@@ -372,17 +372,6 @@ class DhanBroker:
     async def funds_async(self):
         return await asyncio.to_thread(self.available_funds)
 
-    def keep_warm(self) -> None:
-        """A cheap read that keeps the HTTPS connection to Dhan open. Measured:
-        a request on a NEW connection took 327 ms, on an open one 39 ms — the
-        ~290 ms handshake must never land on an order."""
-        try:
-            self._call("GET", "/fundlimit", timeout=5.0)
-        except requests.RequestException:
-            pass
-
-    async def keep_warm_async(self):
-        return await asyncio.to_thread(self.keep_warm)
 
     async def wait_for_fill(self, order_id: str, timeout: float = 6.0, exact: bool = False) -> OrderResult:
         """Wait until the order is final, then return its fill.

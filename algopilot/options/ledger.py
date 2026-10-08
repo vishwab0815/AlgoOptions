@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS candle_log (
     ha_high       REAL NOT NULL,
     ha_low        REAL NOT NULL,
     ha_close      REAL NOT NULL,
-    color         TEXT NOT NULL,        -- GREEN | RED
+    color         TEXT NOT NULL,        -- GREEN | RED | DOJI
     stage_before  TEXT NOT NULL,
     stage_after   TEXT NOT NULL,
     target_level  REAL,

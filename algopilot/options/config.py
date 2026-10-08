@@ -158,6 +158,11 @@ class OptionsConfig:
     # The parked sell is a stop-limit: once triggered it may fill down to this
     # % below the sell price (so a fast drop still fills).
     entry_limit_buffer_pct: float = 3.0
+    # Doji: a candle whose HA body (|close - open|) is at most this % of its
+    # height (high - low) is neither GREEN nor RED. While waiting for candle 1
+    # or candle 2 it is skipped, as if it wasn't there. 0 = off. 5% is the
+    # standard doji test; on a month of NIFTY option candles it marks 1 in 16.
+    doji_body_pct: float = 5.0
 
     # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged). Marks at
     # start, start+step, start+2*step ... points below the entry (5, 8, 11,
@@ -167,6 +172,17 @@ class OptionsConfig:
     profit_lock: bool = True
     profit_lock_start_pts: float = 5.0
     profit_lock_step_pts: float = 3.0
+
+    # Strikes. "premium": each side trades an OUT-OF-THE-MONEY strike whose
+    # premium is between premium_min and premium_max — the farthest such strike
+    # (the cheapest still >= premium_min). It switches only while nothing is
+    # open or waiting, and only once the premium has left the range by more than
+    # premium_buffer. "spot": the old way — PUT = floor(spot/100)*100, CALL +100.
+    strike_pick: str = "premium"
+    premium_min: float = 100.0
+    premium_max: float = 150.0
+    premium_buffer: float = 5.0
+    strike_step: int = 100
 
     # No new entries before this IST time (HH:MM). 09:15 = from the open
     # (the pattern needs 3 candles, so the first possible sell is 09:25-09:30).
@@ -212,6 +228,23 @@ def _squareoff(raw: str) -> str:
         raise OptionsConfigError(f"OPTIONS_SQUAREOFF_AT={raw!r} — use a time between 09:20 and 15:15 "
                                  "(Dhan squares off intraday positions itself from about 15:18).")
     return hhmm
+
+
+def _doji_pct(raw: str) -> float:
+    try:
+        v = float(raw)
+    except ValueError:
+        raise OptionsConfigError(f"OPTIONS_DOJI_BODY_PCT={raw!r} is not a number.")
+    if not 0 <= v < 50:
+        raise OptionsConfigError(f"OPTIONS_DOJI_BODY_PCT={raw!r} — use 0 (off) up to 49; 5 is the standard.")
+    return v
+
+
+def _strike_pick(raw: str) -> str:
+    mode = raw.strip().lower()
+    if mode not in ("premium", "spot"):
+        raise OptionsConfigError(f"OPTIONS_STRIKE_PICK={raw!r} — use 'premium' or 'spot'.")
+    return mode
 
 
 def _entry_mode(raw: str) -> str:
@@ -289,6 +322,15 @@ def load_options_config() -> OptionsConfig:
     if lot_size < 1:
         raise OptionsConfigError("OPTIONS_LOT_SIZE must be >= 1.")
 
+    premium_min = float(os.getenv("OPTIONS_PREMIUM_MIN", "100"))
+    premium_max = float(os.getenv("OPTIONS_PREMIUM_MAX", "150"))
+    if not 0 < premium_min < premium_max:
+        raise OptionsConfigError(
+            f"OPTIONS_PREMIUM_MIN ({premium_min:g}) must be above 0 and below OPTIONS_PREMIUM_MAX ({premium_max:g}).")
+    strike_step = int(os.getenv("OPTIONS_STRIKE_STEP", "100"))
+    if strike_step not in (50, 100):
+        raise OptionsConfigError(f"OPTIONS_STRIKE_STEP={strike_step} — use 100 or 50.")
+
     chain_min_interval = float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_SECS", "5.0"))
     if chain_min_interval <= 0:
         raise OptionsConfigError("OPTIONS_CHAIN_MIN_INTERVAL_SECS must be positive.")
@@ -321,10 +363,16 @@ def load_options_config() -> OptionsConfig:
         entry_offset_pts=max(0.0, float(os.getenv("OPTIONS_ENTRY_OFFSET_POINTS", "0.5"))),
         stop_offset_pts=max(0.0, float(os.getenv("OPTIONS_STOP_OFFSET_POINTS", "0.5"))),
         entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
+        doji_body_pct=_doji_pct(os.getenv("OPTIONS_DOJI_BODY_PCT", "5")),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
         profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "5"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),
+        strike_pick=_strike_pick(os.getenv("OPTIONS_STRIKE_PICK", "premium")),
+        premium_min=premium_min,
+        premium_max=premium_max,
+        premium_buffer=max(0.0, float(os.getenv("OPTIONS_PREMIUM_BUFFER", "5"))),
+        strike_step=strike_step,
         entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:15")),
         roll_on_expiry_day=os.getenv("OPTIONS_ROLL_ON_EXPIRY_DAY", "false").strip().lower() == "true",
         squareoff_at=_squareoff(os.getenv("OPTIONS_SQUAREOFF_AT", "15:10")),

@@ -12,9 +12,14 @@ orders**, recording everything in a local SQLite ledger.
 
 ## Strategy
 
-1. **Strikes** — from NIFTY spot (polled every 5 s): `PUT = floor(spot/100)*100`,
-   `CALL = PUT + 100`. They move only once spot is 15+ points past the
-   hundred, and never while a trade is open.
+1. **Strikes** — by premium (`OPTIONS_STRIKE_PICK=premium`): each side trades an
+   **out-of-the-money** strike (PE below NIFTY, CE above) whose premium is
+   **₹100–150** — the farthest one. NIFTY 22,233: PE 22100 ₹128 / 22000 ₹104 →
+   **PE 22000**; CE 22400 ₹135 / 22500 ₹106 → **CE 22500**. A side keeps its strike
+   until the premium leaves ₹95–155, and never switches while a trade or order
+   is open or a pattern is waiting — the range only picks the strike for the
+   next trade, it never closes one. (`spot` = the old way: PUT = NIFTY rounded
+   down to the hundred, CALL = +100.)
 2. **Expiry** — the nearest weekly, fixed for the day (0 DTE on expiry day
    unless `OPTIONS_ROLL_ON_EXPIRY_DAY=true`).
 3. **Candles** — live ticks, timed by the exchange's trade time, become
@@ -22,7 +27,9 @@ orders**, recording everything in a local SQLite ledger.
    Heikin-Ashi series continues from previous days (like a chart); the
    opening candle is fetched complete.
 4. **Pattern**, on each side's own premium (CE and PE watched all day):
-   candle 1 GREEN, then candle 2 RED.
+   candle 1 GREEN, then candle 2 RED. A **doji** (HA body at most 5% of the
+   candle's height, `OPTIONS_DOJI_BODY_PCT`) is neither colour: while waiting
+   for candle 1 or 2 it is skipped — GREEN, doji, RED makes the RED candle 2.
 5. **Sell order** — the moment candle 2 closes, a sell order goes in at
    **candle 2's HA Low − 0.5** (`OPTIONS_ENTRY_OFFSET_POINTS`). It sells when
    the price reaches it during candle 3, and is cancelled when candle 3 ends.

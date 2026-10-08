@@ -213,7 +213,13 @@ def _print_banner(config) -> None:
          if config.entry_mode == "break" else
          f"│  {'entry':<18} HA GREEN -> RED -> RED breakout at candle 3's close, sell-to-open only"),
         f"│  {'gates':<18} pattern only — no RSI, no volume filter",
-        f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open",
+        (f"│  {'doji':<18} HA body <= {config.doji_body_pct:g}% of the candle's height = neither colour, "
+         f"skipped while waiting for candle 1 / 2" if config.doji_body_pct > 0 else f"│  {'doji':<18} off"),
+        (f"│  {'strikes':<18} out of the money, premium Rs {config.premium_min:g}-{config.premium_max:g} "
+         f"(the farthest); kept until it leaves {config.premium_min - config.premium_buffer:g}-"
+         f"{config.premium_max + config.premium_buffer:g}; never while a trade/order is open"
+         if config.strike_pick == "premium" else
+         f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open"),
         f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
         f"│  {'entries':<18} from {config.entry_start} IST, none after {config.squareoff_at}",
         (f"│  {'fills':<18} the exchange fills the sell at its price; buy stop placed right after the fill"
