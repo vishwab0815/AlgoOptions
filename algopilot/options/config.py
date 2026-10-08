@@ -165,12 +165,12 @@ class OptionsConfig:
     doji_body_pct: float = 5.0
 
     # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged). Marks at
-    # start, start+step, start+2*step ... points below the entry (5, 8, 11,
-    # 14 ...). The first mark touched locks itself; after that the lock stays
-    # one mark behind the best. Sold at 100: touch 95 -> lock 95; 92 -> still
-    # 95; 89 -> 92; 86 -> 89. Buy back when the price comes back to the lock.
+    # start, start+step, start+2*step ... points below the entry (8, 11, 14,
+    # 17 ...). The first mark touched locks itself; after that the lock stays
+    # one mark behind the best. Sold at 100: touch 92 -> lock 92; 89 -> still
+    # 92; 86 -> 89; 83 -> 86. Buy back when the price comes back to the lock.
     profit_lock: bool = True
-    profit_lock_start_pts: float = 5.0
+    profit_lock_start_pts: float = 8.0
     profit_lock_step_pts: float = 3.0
 
     # Strikes. "premium": each side trades an OUT-OF-THE-MONEY strike whose
@@ -365,7 +365,7 @@ def load_options_config() -> OptionsConfig:
         entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
         doji_body_pct=_doji_pct(os.getenv("OPTIONS_DOJI_BODY_PCT", "5")),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
-        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "5"),
+        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "8"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),
         strike_pick=_strike_pick(os.getenv("OPTIONS_STRIKE_PICK", "premium")),
