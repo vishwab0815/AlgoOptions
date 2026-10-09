@@ -208,24 +208,20 @@ def _print_banner(config) -> None:
            else f"{min(config.max_lots_per_trade, config.live_max_lots)} (live cap)"),
         f"│  {'sizing':<18} floor(capital / {config.max_concurrent} / live DhanHQ margin-per-lot)",
         _section("STRATEGY"),
-        (f"│  {'entry':<18} HA GREEN -> RED: SELL parked at the exchange at candle 2's HA Low - "
-         f"{config.entry_offset_pts:g}, fills during candle 3 (else cancelled); sell-to-open only"
-         if config.entry_mode == "break" else
-         f"│  {'entry':<18} HA GREEN -> RED -> RED breakout at candle 3's close, sell-to-open only"),
+        f"│  {'entry':<18} HA GREEN -> RED -> RED: sold at candle 3's close when it broke candle 2's HA Low",
         f"│  {'gates':<18} pattern only — no RSI, no volume filter",
-        (f"│  {'doji':<18} HA body <= {config.doji_body_pct:g}% of the candle's height = neither colour, "
-         f"skipped while waiting for candle 1 / 2" if config.doji_body_pct > 0 else f"│  {'doji':<18} off"),
-        (f"│  {'strikes':<18} out of the money, premium Rs {config.premium_min:g}-{config.premium_max:g} "
-         f"(the farthest); kept until it leaves {config.premium_min - config.premium_buffer:g}-"
-         f"{config.premium_max + config.premium_buffer:g}; never while a trade/order is open"
+        f"│  {'trades/day':<18} " + (f"at most {config.max_trades_per_day} (CE + PE together)"
+                                     if config.max_trades_per_day else "no limit"),
+        (f"│  {'strikes':<18} CE and PE each: premium Rs {config.premium_min:g}-{config.premium_max:g} "
+         f"(in or out of the money, closest to {(config.premium_min + config.premium_max) / 2:g}); kept until it "
+         f"leaves {config.premium_min - config.premium_buffer:g}-{config.premium_max + config.premium_buffer:g}; "
+         f"never while a trade is open"
          if config.strike_pick == "premium" else
          f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open"),
         f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
         f"│  {'entries':<18} from {config.entry_start} IST, none after {config.squareoff_at}",
-        (f"│  {'fills':<18} the exchange fills the sell at its price; buy stop placed right after the fill"
-         if config.entry_mode == "break" else
-         f"│  {'fills':<18} market price at signal (raw close); stop fills at the tick that hits it"),
-        f"│  {'exit':<18} stop = HA high 2 candles back + {config.stop_offset_pts:g} (trails each close) "
+        f"│  {'fills':<18} market price at signal (raw close); stop fills at the tick that hits it",
+        f"│  {'exit':<18} stop = HA high 2 candles back (candle 2's while candle 4 trades, 3's while 5 ...) "
         f"+ {config.squareoff_at} square-off",
         (f"│  {'profit lock':<18} {config.profit_lock_start_pts:g} pts below entry, then every "
          f"{config.profit_lock_step_pts:g} pts (one step behind); buy back when it comes back"

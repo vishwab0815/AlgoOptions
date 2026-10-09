@@ -29,7 +29,7 @@ to manage itself.
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional, Callable
+from typing import List, Optional, Callable
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 

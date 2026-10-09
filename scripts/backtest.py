@@ -25,8 +25,9 @@ _compare_sequencing.py, which between them:
 Known limits, stated rather than hidden:
   - inside a bar the path is assumed O-L-H-C (rising bar) or O-H-L-C
     (falling bar) — see _walk_bar;
-  - the strike band is the day's OPENING band; intraday re-banding when spot
-    crosses a hundred is not replayed;
+  - strikes are the day's OPENING spot band (PUT = floor-hundred, CALL +100),
+    not the live engine's pick by premium (Rs 100-150); intraday switching is
+    not replayed;
   - inside one 5-minute bar the order of high and low is unknown, so a stop is
     assumed hit whenever the bar's high reaches it;
   - an already-expired weekly series can't be fetched from any API, so for
@@ -84,17 +85,13 @@ def _walk_bar(e, side, leg, c, at) -> None:
     prev = None
     for p in path:
         pos = leg.position
-        a = e._armed
-        waiting = a is not None and a.side == side and a.leg is leg and a.state == "ARMED"
-        if pos is None and not waiting:
+        if pos is None:
             return
-        if prev is not None and p > prev and pos is not None:
+        if prev is not None and p > prev:
             for level in sorted(x for x in (pos.cover_level, pos.lock_price) if x > 0 and prev < x < p):
                 e._check_exits(side, leg, level, False, at_time=at)
                 if leg.position is None:
                     return
-        elif prev is not None and p < prev and waiting and p < a.trigger < prev:
-            e._on_tick_price(side, leg, a.trigger, False, at)        # the waiting sell fills at its price
         e._on_tick_price(side, leg, p, False, at)
         prev = p
 
@@ -179,26 +176,21 @@ async def _replay_day(cfg, client, day: date, expiry: str, independent: bool, tm
     tf = timedelta(seconds=cfg.candle_timeframe_secs)
     stream = sorted(((c["timestamp"], side, c) for side in _LEGS for c in bars[side][1]),
                     key=lambda x: (x[0], x[1]))
-    unique = list({id(x): x for x in engines.values()}.values())
     for ts, group in groupby(stream, key=lambda x: x[0]):
         group = list(group)
         start = datetime.fromtimestamp(ts, tz=timezone.utc)
         start_ist = start.astimezone(_IST)
-        # 1) inside this bar (both legs): a waiting sell may fill, open trades may exit
+        # 1) inside this bar (both legs): open trades may exit
         for _, side, c in group:
             e = engines[side if independent else "both"]
             leg = e.legs[side]
             pos = leg.position
-            a = e._armed
-            waiting = a is not None and a.side == side and a.leg is leg
             if pos is not None and start_ist.strftime("%H:%M") >= cfg.squareoff_at:
                 e._check_exits(side, leg, c["open"], True, at_time=start_ist)      # first tick at the square-off
-            elif pos is not None or waiting:
+            elif pos is not None:
                 _walk_bar(e, side, leg, c, start_ist)
             e._last_premium[side] = c["close"]
-        # 2) the bar closes: an unfilled sell is cancelled, then each leg's candle is evaluated
-        for e in unique:
-            await e._expire_armed(start + tf)
+        # 2) the bar closes: each leg's candle is evaluated (a signal sells at its close)
         for _, side, c in group:
             e = engines[side if independent else "both"]
             leg = e.legs[side]
@@ -210,10 +202,7 @@ async def _replay_day(cfg, client, day: date, expiry: str, independent: bool, tm
                 # The 'my sheet' model: every signal on each leg, so the live
                 # engine's fresh-pattern-after-exit rule doesn't apply here.
                 e._last_exit_at.clear()
-            await e._on_candle_close(side, leg, candle, squareoff_at_close, arm_now=False)
-        # 3) one sell order for the next bar (CE vs PE decided together, as live)
-        for e in unique:
-            await e._arm_best(start + tf)
+            await e._on_candle_close(side, leg, candle, squareoff_at_close)
 
     trades, skips = [], Counter()
     for e in engines.values():

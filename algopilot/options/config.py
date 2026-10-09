@@ -6,9 +6,10 @@ OPTIONS_PAPER_TRADING=false -> LIVE: real orders on DhanHQ (see broker.py), real
 Live mode always runs with a daily loss limit (OPTIONS_MAX_DAILY_LOSS, default
 Rs 3,000) after which no new trade is opened.
 
-Entries are pure Heikin-Ashi pattern (candle 1 GREEN, candle 2 RED, sell
-during candle 3) — no RSI gate, no volume gate. A position is closed by the
-Heikin-Ashi stop, the profit lock, or the square-off — whichever comes first.
+Entries are pure Heikin-Ashi pattern GREEN -> RED -> RED, sold at candle 3's
+close when it broke candle 2's HA Low — no RSI gate, no volume gate. A position
+is closed by the Heikin-Ashi stop (HA High 2 candles back), the profit lock if
+switched on, or the square-off — whichever comes first.
 """
 from __future__ import annotations
 
@@ -144,40 +145,24 @@ class OptionsConfig:
     official_candles: bool = True
     official_candle_wait_ms: int = 1500
 
-    # Entry (version 2). "break": when candle 2 (RED after GREEN) closes, a
-    # SELL is parked at the exchange at candle 2's HA Low minus
-    # entry_offset_pts; it fills the moment candle 3's price reaches it, and is
-    # cancelled if candle 3 closes first. "close": the original entry — sell
-    # at candle 3's close when it broke the level.
-    entry_mode: str = "break"
-    entry_offset_pts: float = 0.5
-    # The Heikin-Ashi stop is placed this many points ABOVE the HA High it
-    # uses (candle 2's while candles 3-4 form, then 2 candles back): HA High
-    # 100 -> buy stop at 100.50.
-    stop_offset_pts: float = 0.5
-    # The parked sell is a stop-limit: once triggered it may fill down to this
-    # % below the sell price (so a fast drop still fills).
-    entry_limit_buffer_pct: float = 3.0
-    # Doji: a candle whose HA body (|close - open|) is at most this % of its
-    # height (high - low) is neither GREEN nor RED. While waiting for candle 1
-    # or candle 2 it is skipped, as if it wasn't there. 0 = off. 5% is the
-    # standard doji test; on a month of NIFTY option candles it marks 1 in 16.
-    doji_body_pct: float = 5.0
+    # At most this many trades a day, CE and PE together (0 = no limit).
+    max_trades_per_day: int = 6
 
-    # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged). Marks at
+    # Profit lock — OFF in the old strategy (exit = the HA stop only); an extra
+    # exit when switched on (OPTIONS_PROFIT_LOCK=true). Marks at
     # start, start+step, start+2*step ... points below the entry (8, 11, 14,
     # 17 ...). The first mark touched locks itself; after that the lock stays
     # one mark behind the best. Sold at 100: touch 92 -> lock 92; 89 -> still
     # 92; 86 -> 89; 83 -> 86. Buy back when the price comes back to the lock.
-    profit_lock: bool = True
+    profit_lock: bool = False
     profit_lock_start_pts: float = 8.0
     profit_lock_step_pts: float = 3.0
 
-    # Strikes. "premium": each side trades an OUT-OF-THE-MONEY strike whose
-    # premium is between premium_min and premium_max — the farthest such strike
-    # (the cheapest still >= premium_min). It switches only while nothing is
-    # open or waiting, and only once the premium has left the range by more than
-    # premium_buffer. "spot": the old way — PUT = floor(spot/100)*100, CALL +100.
+    # Strikes. "premium": CE and PE each trade the strike whose premium is
+    # between premium_min and premium_max (in or out of the money); several in
+    # range -> the one closest to the middle (125). A side switches only while
+    # no trade is open, and only once its premium has left the range by more
+    # than premium_buffer (95-155). "spot": PUT = floor(spot/100)*100, CALL +100.
     strike_pick: str = "premium"
     premium_min: float = 100.0
     premium_max: float = 150.0
@@ -193,9 +178,9 @@ class OptionsConfig:
     # Stop the engine by itself once the market has closed (HH:MM IST, and only
     # when no position is open). "" = run until stopped by hand.
     auto_stop_at: str = "15:31"
-    # Square-off (HH:MM IST): every open trade is bought back, and no new sell
-    # order whose candle 3 would end at/after it. Must be before Dhan's own
-    # intraday auto square-off (~15:18), so 15:15 at the latest.
+    # Square-off (HH:MM IST): every open trade is bought back, and no new
+    # trade from then on. Must be before Dhan's own intraday auto square-off
+    # (~15:18), so 15:15 at the latest.
     squareoff_at: str = "15:10"
 
     # Cost model applied to every paper fill — see charges.py. Defaults are
@@ -230,27 +215,10 @@ def _squareoff(raw: str) -> str:
     return hhmm
 
 
-def _doji_pct(raw: str) -> float:
-    try:
-        v = float(raw)
-    except ValueError:
-        raise OptionsConfigError(f"OPTIONS_DOJI_BODY_PCT={raw!r} is not a number.")
-    if not 0 <= v < 50:
-        raise OptionsConfigError(f"OPTIONS_DOJI_BODY_PCT={raw!r} — use 0 (off) up to 49; 5 is the standard.")
-    return v
-
-
 def _strike_pick(raw: str) -> str:
     mode = raw.strip().lower()
     if mode not in ("premium", "spot"):
         raise OptionsConfigError(f"OPTIONS_STRIKE_PICK={raw!r} — use 'premium' or 'spot'.")
-    return mode
-
-
-def _entry_mode(raw: str) -> str:
-    mode = raw.strip().lower()
-    if mode not in ("break", "close"):
-        raise OptionsConfigError(f"OPTIONS_ENTRY_MODE={raw!r} — use 'break' or 'close'.")
     return mode
 
 
@@ -359,12 +327,8 @@ def load_options_config() -> OptionsConfig:
         candle_close_grace_ms=max(0, int(os.getenv("OPTIONS_CANDLE_CLOSE_GRACE_MS", "0"))),
         official_candles=os.getenv("OPTIONS_OFFICIAL_CANDLES", "true").strip().lower() == "true",
         official_candle_wait_ms=max(0, int(os.getenv("OPTIONS_OFFICIAL_CANDLE_WAIT_MS", "1500"))),
-        entry_mode=_entry_mode(os.getenv("OPTIONS_ENTRY_MODE", "break")),
-        entry_offset_pts=max(0.0, float(os.getenv("OPTIONS_ENTRY_OFFSET_POINTS", "0.5"))),
-        stop_offset_pts=max(0.0, float(os.getenv("OPTIONS_STOP_OFFSET_POINTS", "0.5"))),
-        entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
-        doji_body_pct=_doji_pct(os.getenv("OPTIONS_DOJI_BODY_PCT", "5")),
-        profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
+        max_trades_per_day=max(0, int(os.getenv("OPTIONS_MAX_TRADES_PER_DAY", "6"))),
+        profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "false").strip().lower() == "true",
         profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "8"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),

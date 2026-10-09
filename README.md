@@ -12,66 +12,51 @@ orders**, recording everything in a local SQLite ledger.
 
 ## Strategy
 
-1. **Strikes** — by premium (`OPTIONS_STRIKE_PICK=premium`): each side trades an
-   **out-of-the-money** strike (PE below NIFTY, CE above) whose premium is
-   **₹100–150** — the farthest one. NIFTY 22,233: PE 22100 ₹128 / 22000 ₹104 →
-   **PE 22000**; CE 22400 ₹135 / 22500 ₹106 → **CE 22500**. A side keeps its strike
-   until the premium leaves ₹95–155, and never switches while a trade or order
-   is open or a pattern is waiting — the range only picks the strike for the
-   next trade, it never closes one. (`spot` = the old way: PUT = NIFTY rounded
-   down to the hundred, CALL = +100.)
+1. **Strikes** — by premium (`OPTIONS_STRIKE_PICK=premium`): CE and PE are picked
+   **separately**, each the strike whose premium is **₹100–150** — in or out of
+   the money doesn't matter. Several in range → the one closest to ₹125.
+   NIFTY 22,233: CE 22100 ₹145 / CE 22200 ₹112 → **CE 22200**. A side keeps its
+   strike until its premium leaves ₹95–155, and never switches while a trade is
+   open — the range only picks the strike for the next trade, it never closes
+   one. Checked every ~5 s. (`spot` = PUT = NIFTY rounded down to the hundred,
+   CALL = +100.)
 2. **Expiry** — the nearest weekly, fixed for the day (0 DTE on expiry day
    unless `OPTIONS_ROLL_ON_EXPIRY_DAY=true`).
 3. **Candles** — live ticks, timed by the exchange's trade time, become
-   5-minute candles closed at exactly hh:mm:00.000, then Heikin-Ashi. The
-   Heikin-Ashi series continues from previous days (like a chart); the
-   opening candle is fetched complete.
-4. **Pattern**, on each side's own premium (CE and PE watched all day):
-   candle 1 GREEN, then candle 2 RED. A **doji** (HA body at most 5% of the
-   candle's height, `OPTIONS_DOJI_BODY_PCT`) is neither colour: while waiting
-   for candle 1 or 2 it is skipped — GREEN, doji, RED makes the RED candle 2.
-5. **Sell order** — the moment candle 2 closes, a sell order goes in at
-   **candle 2's HA Low − 0.5** (`OPTIONS_ENTRY_OFFSET_POINTS`). It sells when
-   the price reaches it during candle 3, and is cancelled when candle 3 ends.
-   If the price is already below it, it sells at once.
-6. **Rules** — one trade at a time and one order at a time. Both sides ready
-   together: the side with fewer trades today (if equal, the closer price).
-   A pattern that completes while the **other** side's trade is open waits:
-   if that trade closes before its candle 3 ends, the sell order goes in then
-   (or it sells at once if the price is already below). The same side trades
-   again only after a GREEN that closes after its exit (the exit candle itself
-   counts if it closes GREEN). No new trades after the square-off time or
-   after the daily loss limit; from 09:15.
-7. **Stop** — **HA High + 0.5** (`OPTIONS_STOP_OFFSET_POINTS`): candle 2's
-   while candles 3 and 4 form, then the HA High from 2 candles back, moved at
-   every candle close.
-8. **Profit lock** — first at 8 points, then every 3 points (8, 11, 14, 17, 20 …),
-   always one step behind the best (`OPTIONS_PROFIT_LOCK_START_POINTS`,
-   `OPTIONS_PROFIT_LOCK_STEP_POINTS`). Live, it sits at the exchange. Sold at 100:
-
-   | Lowest price | Points | Buy back at | Points kept |
-   |---|---|---|---|
-   | 92 | 8 | 92 | 8 |
-   | 89 | 11 | 92 | 8 |
-   | 86 | 14 | 89 | 11 |
-   | 83 | 17 | 86 | 14 |
-   | 80 | 20 | 83 | 17 |
-9. **Exit** — stop hit, profit lock hit, or everything bought back at **15:10**
+   5-minute candles closed at exactly hh:mm:00.000 (Dhan's own bar is used,
+   the same one the chart shows), then Heikin-Ashi. The Heikin-Ashi series
+   continues from previous days (like a chart).
+4. **Pattern — GREEN → RED → RED**, on each side's own premium (CE and PE watched
+   all day): candle 1 GREEN; candle 2 RED — its **HA Low** is the level;
+   candle 3 RED and **breaks the level** (its HA Low or HA Close below it) →
+   **sell at candle 3's close** (market order).
+5. **Rules** — one trade at a time; **at most 6 trades a day**, CE and PE
+   together (`OPTIONS_MAX_TRADES_PER_DAY`). The same side trades again only after
+   a GREEN that closes after its exit. No new trades after the square-off time
+   or after the daily loss limit; from 09:15.
+6. **Stop — HA High 2 candles back**, moved at every candle close: candle 2's
+   while candle 4 trades, candle 3's while candle 5 trades, and so on.
+   Example: sold at 75 after candle 3; candle 2's HA High 116 → stop 116;
+   candle 3's HA High 93 → stop 93 while candle 5 trades.
+7. **Profit lock** — off (`OPTIONS_PROFIT_LOCK=false`): the exit is the HA stop.
+   Switched on, it adds a lock at 8 points, then every 3 points, one step
+   behind the best.
+8. **Exit** — stop hit, or everything bought back at **15:10**
    (`OPTIONS_SQUAREOFF_AT`).
-10. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
+9. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
    (rates in `.env`, estimates — check a contract note).
 
 ## Live mode
 
-- Entry: a sell stop-limit parked at the exchange at the sell price (fills the
-  moment the price gets there); the exchange's fill price and quantity are recorded.
-  The buy stop goes in right after the fill.
-- A **stop-limit BUY rests at the exchange** at whichever is closer to the price:
-  the HA stop (moved every candle) or the profit lock (moved as soon as a new
-  lock is set, once the price is below it). The exchange fills it the moment
-  price touches it, and you stay protected even if the engine or VM stops.
-  If price gaps past its limit, the engine cancels it and buys back at market.
-  If the lock isn't parked yet when price comes back, the engine buys back itself.
+- Entry: a market SELL at candle 3's close; the exchange's fill price and
+  quantity are recorded, and the buy stop goes in right after the fill.
+- A **stop-limit BUY rests at the exchange** at the HA stop (moved every candle;
+  with the profit lock on, at whichever of the two is closer). The exchange
+  fills it the moment price touches it, and you stay protected even if the
+  engine or VM stops. If price gaps past its limit, the engine cancels it and
+  buys back at market.
+- Funds are read fresh from Dhan right after every exit, so the next trade is
+  never refused for "insufficient funds" with money still held for the last one.
 - Hard cap of 1 lot (`OPTIONS_LIVE_MAX_LOTS`), daily loss limit
   (`OPTIONS_MAX_DAILY_LOSS`, default ₹3,000).
 - On restart it checks Dhan's real positions before trading.
