@@ -1,0 +1,120 @@
+# AGENTS.md — guide for AI coding agents
+
+AlgoPilotX Options: a **live, real-money** NIFTY weekly-options selling engine on
+DhanHQ v2. One asyncio Python process; Heikin-Ashi pattern on each option's own
+premium; sell-to-open only; SQLite ledger. Read this before changing anything.
+
+## 1. Safety rules (never break these)
+
+1. **Real money.** With `OPTIONS_PAPER_TRADING=false` every order is real
+   (account 1101141313). Never run the engine live to "try something".
+2. **Tests never place real orders.** Use paper mode or a fake broker object;
+   never construct a real `DhanBroker` call path in a test.
+3. **Never touch the production ledger** `data/options_ledger.db` in tests or
+   experiments — give every test engine its own temporary `db_path`.
+4. **The strategy is frozen.** Do not change entry / exit / sizing rules
+   without the owner's explicit approval. Infrastructure, logging, speed and
+   realism fixes are fine; say what you changed.
+5. **Secrets.** `.env` (token), `secrets.env` (Dhan PIN + TOTP key) and
+   `data/` are git-ignored — never commit, print, log or zip them. Never ask the
+   owner to paste the PIN or TOTP key in chat.
+6. **No token generation during market hours** (09:15–15:30 IST): a new token
+   can invalidate the one the running engine uses. The nightly job runs at 21:00.
+7. **Orders only from the VM.** Dhan accepts orders only from the registered
+   static IP (the Windows VM, 135.13.32.41). The VM updates with `git pull`;
+   its `.env` / `secrets.env` / `data/` stay on the VM and are not changed by git.
+8. **Don't disturb a running engine** during market hours (no restarts, no
+   live smoke tests on the same account).
+9. **Commit messages**: plain descriptions of the change; do not mention AI
+   tools or assistants in them.
+
+## 2. Branches
+
+| Branch | What it is |
+|---|---|
+| `main` | Original strategy (GREEN→RED→RED at candle 3's close), older code |
+| `version-2` / `version-3` | History: early sell order (HA Low − 1 / − 0.5), offsets, 15:10 |
+| `version-4` | v3 + fresh-funds fix, pre-close warm-up, doji rule, strikes by premium (OTM) |
+| **`version-5`** | **Current.** Version 4's strategy unchanged + strikes by premium ₹100–150 (any moneyness) + profit lock 20/3 + max 6 trades a day |
+| `old-strategy` | Local only: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
+| `generate_token_automation` | History: nightly token + pipeline (merged into v3+) |
+
+Work only on the branch the owner names; create new versions as new branches
+from the one they name. Don't merge between strategy branches unasked.
+
+## 3. The strategy on `version-5` (5-minute Heikin-Ashi)
+
+- **Strikes** (`OPTIONS_STRIKE_PICK=premium`): CE and PE picked separately —
+  the strike whose premium is ₹100–150, in or out of the money; several →
+  closest to ₹125. Kept while the premium stays ₹95–155. Never switched while
+  a position, a sell order, an entry in flight or a waiting pattern exists.
+  Checked on every option-chain poll (~5 s).
+- **Pattern**: candle 1 GREEN, candle 2 RED (a **doji** — HA body ≤ 5% of its
+  height — is skipped while waiting for candle 1 or 2).
+- **Entry** (`OPTIONS_ENTRY_MODE=break`): when candle 2 closes, a SELL
+  stop-limit is parked at the exchange at **candle 2's HA Low − 0.5**; it fills
+  during candle 3 or is cancelled when candle 3 ends; if the price is already
+  below, sell at market. One order at a time; CE+PE together → fewer trades
+  today, then closer price.
+- **Waiting order**: if the other side's trade is open when candle 2 closes,
+  the order goes in the moment that trade exits (only until candle 3 ends).
+- **Stop**: HA High + 0.5 — candle 2's while candles 3–4 form, then the HA High
+  2 candles back, moved every close. Live it rests at the exchange as a BUY
+  stop-limit (limit +10%); not filled 3 s after crossing → market buy.
+- **Profit lock 20/3**: first lock at 20 points, then every 3, one step behind
+  (sold 100: 80→80, 77→80, 74→77). Parked at the exchange when tighter.
+- **Limits**: max 6 trades/day (CE+PE), 1 lot live, daily loss limit
+  (`OPTIONS_MAX_DAILY_LOSS`), same side needs a fresh GREEN after its exit,
+  entries from 09:15, square-off at **15:10**, engine auto-stops 15:31.
+
+Every setting lives in `.env`; `.env.example` lists all of them with comments,
+in the same order. When you add a setting, add it to both and to `config.py`
+with validation.
+
+## 4. Code map
+
+| Path | Role |
+|---|---|
+| `run_options.py` | Entry point: logging, startup banner, runs `OptionsEngine` |
+| `algopilot/options/engine.py` | The engine: candle clock, pattern, entries, exits, strikes, live order handling, state restore |
+| `algopilot/options/config.py` | All `OPTIONS_*` settings, defaults and validation |
+| `algopilot/options/broker.py` | Live orders (DhanBroker), order-update stream |
+| `algopilot/options/dhan_client.py` | Option chain, candles, margin, contract list |
+| `algopilot/options/position.py` | Open position, HA trailing stop level, profit-lock level |
+| `algopilot/options/ledger.py` | SQLite ledger: trades, events, candle log, saved state |
+| `algopilot/options/websocket.py` | Live price feed |
+| `algopilot/options/charges.py` | Brokerage/STT/fees/GST model |
+| `algopilot/options/auto_token.py` | Token from PIN + TOTP |
+| `algopilot/core/` | Candle builder, Heikin-Ashi |
+| `algopilot/strategy/` | GREEN→RED→RED state machine (`signal_engine.py`) |
+| `algopilot/utils/market_hours.py`, `market_calendar.py` | Session times, square-off time, NSE holidays |
+| `scripts/daily_pipeline.py` | Run-forever automation on the VM (token 21:00, session 08:45) |
+| `scripts/backtest.py` | Replays real Dhan days through the engine (opening spot band only) |
+| `scripts/export_candle_log.py` | Candle-log tables/CSVs for analysis |
+
+Runtime files (git-ignored): `data/options_engine.log`, `data/options_ledger.db`,
+`data/pipeline.log`, `data/STOP` (clean stop), `data/KILL` (buy back all + stop).
+
+## 5. Working on it
+
+- **Verify with real data.** Before claiming a cause or a fix, reproduce it from
+  the real log / real Dhan candles and the engine's own code. Ask the owner for
+  `data/options_engine.log` from the VM when a live issue is reported.
+- **Test offline**: a fake broker (orders, fills, positions, funds) and a fake
+  margin client; temporary ledger; patch `get_market_status` for time. Check
+  both paper and live code paths. Run `python -m pyflakes run_options.py algopilot scripts`
+  — it must be clean.
+- **Files**: Windows, many files use CRLF — preserve line endings when editing.
+- **Logs** are for a human: one line per decision, with the reason and numbers
+  (e.g. `-> SKIPPED: 6 trades already today`).
+- **Talking to the owner**: short, simple words, numbers and an example; when
+  asked to "just answer", don't change anything.
+
+## 6. Open items (as of 12-Oct-2026)
+
+- On 09-Oct the owner reported strike picking "not working" on the VM with
+  version 4; the VM log has not been seen yet. Robustness fixes are in v5, but
+  the real cause is unconfirmed.
+- `scripts/backtest.py` uses the opening spot band, not the premium picker.
+- Month replays (07-Sep → 07-Oct) were net negative for every variant tested;
+  charges (~₹7–9k/month at 1 lot) outweigh the gross edge.
