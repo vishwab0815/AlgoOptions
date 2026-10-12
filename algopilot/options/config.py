@@ -164,20 +164,24 @@ class OptionsConfig:
     # standard doji test; on a month of NIFTY option candles it marks 1 in 16.
     doji_body_pct: float = 5.0
 
+    # At most this many trades a day, CE and PE together (0 = no limit).
+    max_trades_per_day: int = 6
+
     # Profit lock (an extra exit; the Heikin-Ashi stop is unchanged). Marks at
-    # start, start+step, start+2*step ... points below the entry (8, 11, 14,
-    # 17 ...). The first mark touched locks itself; after that the lock stays
-    # one mark behind the best. Sold at 100: touch 92 -> lock 92; 89 -> still
-    # 92; 86 -> 89; 83 -> 86. Buy back when the price comes back to the lock.
+    # start, start+step, start+2*step ... points below the entry (20, 23, 26,
+    # 29 ...). The first mark touched locks itself; after that the lock stays
+    # one mark behind the best. Sold at 100: touch 80 -> lock 80; 77 -> still
+    # 80; 74 -> 77; 71 -> 74. Buy back when the price comes back to the lock.
     profit_lock: bool = True
-    profit_lock_start_pts: float = 8.0
+    profit_lock_start_pts: float = 20.0
     profit_lock_step_pts: float = 3.0
 
-    # Strikes. "premium": each side trades an OUT-OF-THE-MONEY strike whose
-    # premium is between premium_min and premium_max — the farthest such strike
-    # (the cheapest still >= premium_min). It switches only while nothing is
-    # open or waiting, and only once the premium has left the range by more than
-    # premium_buffer. "spot": the old way — PUT = floor(spot/100)*100, CALL +100.
+    # Strikes. "premium": CE and PE each trade the strike whose premium is
+    # between premium_min and premium_max (in or out of the money); several in
+    # range -> the one closest to the middle (125). A side switches only while
+    # nothing is open or waiting, and only once its premium has left the range
+    # by more than premium_buffer (95-155). "spot": PUT = floor(spot/100)*100,
+    # CALL +100.
     strike_pick: str = "premium"
     premium_min: float = 100.0
     premium_max: float = 150.0
@@ -364,8 +368,9 @@ def load_options_config() -> OptionsConfig:
         stop_offset_pts=max(0.0, float(os.getenv("OPTIONS_STOP_OFFSET_POINTS", "0.5"))),
         entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
         doji_body_pct=_doji_pct(os.getenv("OPTIONS_DOJI_BODY_PCT", "5")),
+        max_trades_per_day=max(0, int(os.getenv("OPTIONS_MAX_TRADES_PER_DAY", "6"))),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
-        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "8"),
+        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "20"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "3"))),
         strike_pick=_strike_pick(os.getenv("OPTIONS_STRIKE_PICK", "premium")),

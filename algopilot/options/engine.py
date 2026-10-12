@@ -11,9 +11,10 @@ Real-time pipeline:
         -> every tick on an open leg: Heikin-Ashi trailing stop, EOD square-off
 
 Entries are PURE pattern — no RSI gate, no volume gate. Three things close a
-position: the Heikin-Ashi trailing stop, the profit lock (8 points below the
+position: the Heikin-Ashi trailing stop, the profit lock (20 points below the
 entry, then every 3 points, one step behind the best — see _track_profit), and the
 EOD square-off (OPTIONS_SQUAREOFF_AT, 15:10). Whichever is reached first.
+At most OPTIONS_MAX_TRADES_PER_DAY trades a day (6), CE and PE together.
 
 Sequencing: BOTH legs are watched all day — whichever breaks its pattern
 FIRST fires, and the other leg can't open while that position is open (one
@@ -52,7 +53,7 @@ import uuid
 from dataclasses import dataclass, field, replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from ..core.candle_builder import Candle, CandleBuilder
@@ -88,28 +89,27 @@ def resolve_band(spot: float) -> tuple:
 def pick_strike(chain, side: str, low: float, high: float, step: int) -> Optional[Tuple[float, float, bool]]:
     """(strike, premium, in range) for one side from the option chain, or None.
 
-    Only OUT-OF-THE-MONEY strikes on the `step` grid count (PE below spot, CE
-    above). Of those with a premium between `low` and `high`, the FARTHEST one
-    wins — the cheapest still >= `low`. If none is in range, the one whose
-    premium is closest to the range. NIFTY 22,233: PE 22200 Rs 165, 22100 Rs 128,
-    22000 Rs 104, 21900 Rs 82 -> PE 22000; CE 22300 Rs 170, 22400 Rs 135,
-    22500 Rs 106, 22600 Rs 84 -> CE 22500."""
+    By PREMIUM only — in or out of the money doesn't matter; CE and PE are
+    picked separately. Of the strikes on the `step` grid whose premium is
+    between `low` and `high`, the one closest to the middle of the range wins
+    (100-150 -> closest to 125; a tie -> the cheaper). If none is in range, the
+    one closest to the range. NIFTY 22,233, expiry day: CE 22100 Rs 145,
+    22200 Rs 112, 22300 Rs 78 -> CE 22200 (112 is closer to 125 than 145)."""
     key = side.lower()
-    otm = []
-    for strike, quotes in (chain.legs or {}).items():
-        q = (quotes or {}).get(key)
+    mid = (low + high) / 2.0
+    quotes = []
+    for strike, row in (chain.legs or {}).items():
+        q = (row or {}).get(key)
         price = getattr(q, "last_price", 0.0) or 0.0
-        on_grid = abs(strike / step - round(strike / step)) < 1e-6
-        beyond = strike < chain.spot if side == "PE" else strike > chain.spot
-        if price > 0 and on_grid and beyond:
-            otm.append((float(strike), float(price)))
-    if not otm:
+        if price > 0 and abs(strike / step - round(strike / step)) < 1e-6:
+            quotes.append((float(strike), float(price)))
+    if not quotes:
         return None
-    inside = [(k, p) for k, p in otm if low <= p <= high]
+    inside = [(k, p) for k, p in quotes if low <= p <= high]
     if inside:
-        k, p = min(inside, key=lambda x: x[1])            # the farthest = the cheapest in range
+        k, p = min(inside, key=lambda x: (abs(x[1] - mid), x[1]))
         return k, p, True
-    k, p = min(otm, key=lambda x: ((low - x[1]) if x[1] < low else (x[1] - high), x[1]))   # a tie: the farther one
+    k, p = min(quotes, key=lambda x: ((low - x[1]) if x[1] < low else (x[1] - high), x[1]))
     return k, p, False
 
 
@@ -194,6 +194,10 @@ def _decided_after(candle_end: datetime) -> str:
     if not 0.0 <= ms < 60_000.0:
         return ""
     return f" | +{ms:.1f} ms after {candle_end.astimezone(_IST):%H:%M:%S}"
+
+
+def _strike_text(strike: Optional[float]) -> str:
+    return "-" if strike is None else f"{strike:.0f}"
 
 
 def _in_session(epoch_seconds: float) -> bool:
@@ -892,7 +896,7 @@ class OptionsEngine:
                     self.config.nifty_security_id, self.config.nifty_index_segment, self.expiry,
                 )
                 if chain is not None and chain.spot > 0:
-                    band_was_unset = self.put_strike is None
+                    band_was_unset = self.put_strike is None and self.call_strike is None
                     if band_was_unset:
                         # Explicit two-step sequence, logged in this order on
                         # purpose: check the real NIFTY 50 spot FIRST, THEN
@@ -910,10 +914,11 @@ class OptionsEngine:
                     # with security_id=None and no live subscription. The
                     # engine looked "stuck": band kept announcing changes,
                     # but nothing was ever actually wired up to trade them.
-                    if self.put_strike is not None and (self.put_strike, self.call_strike) != before:
+                    have_strikes = self.put_strike is not None or self.call_strike is not None
+                    if have_strikes and (self.put_strike, self.call_strike) != before:
                         await self._resolve_contracts_and_subscribe()
-                    elif self.put_strike is not None and any(
-                        self.legs[s].security_id is None for s in _LEGS
+                    elif have_strikes and any(
+                        self.legs[s].strike is not None and self.legs[s].security_id is None for s in _LEGS
                     ):
                         # BUG FIXED: band unchanged, but a leg never resolved
                         # its contract last attempt (transient failure) and
@@ -1040,7 +1045,7 @@ class OptionsEngine:
                 self._note_exit(s, datetime.fromisoformat(iso))
             except (TypeError, ValueError):
                 pass
-        if self.put_strike is None:
+        if self.put_strike is None and self.call_strike is None:
             return False
 
         restored_position = False
@@ -1077,8 +1082,8 @@ class OptionsEngine:
             )
 
         logger.info(
-            "Restored state from an earlier run today: PUT %.0f / CALL %.0f | expiry=%s | last exit %s%s",
-            self.put_strike, self.call_strike, self.expiry, self._last_exits_text(),
+            "Restored state from an earlier run today: PUT %s / CALL %s | expiry=%s | last exit %s%s",
+            _strike_text(self.put_strike), _strike_text(self.call_strike), self.expiry, self._last_exits_text(),
             " | open position restored" if restored_position else " | no open position",
         )
         return True
@@ -1162,20 +1167,20 @@ class OptionsEngine:
         self.legs = {side: self._new_leg(side) for side in _LEGS}
 
     def _maybe_pick_strikes(self, chain) -> None:
-        """OPTIONS_STRIKE_PICK=premium (08-Oct, approved): each side trades an
-        out-of-the-money strike whose premium is in OPTIONS_PREMIUM_MIN..MAX —
-        the farthest one (see pick_strike).
+        """OPTIONS_STRIKE_PICK=premium: CE and PE each trade the strike whose
+        premium is between OPTIONS_PREMIUM_MIN and _MAX (100-150), in or out of
+        the money — see pick_strike. Checked on every option-chain poll (~5 s).
 
-        - Never while anything is open or waiting (band_frozen): a trade stays
-          on its strike to the end even if its premium leaves the range — the
-          range only chooses the strike for the NEXT trade.
-        - A side keeps its strike while the premium is within the range +/-
-          OPTIONS_PREMIUM_BUFFER (95-155) and the strike is still out of the
-          money — no switching back and forth on every tick around 100.
-        - No strike in range: a side keeps a strike it already has (if still out
-          of the money); otherwise it takes the closest one, with a warning.
-        - A side that switches starts fresh on the new contract (history
-          rebuilt, new pattern); the other side keeps its pattern."""
+        - Never while anything is open or waiting (band_frozen): a trade stays on
+          its strike to the end even if its premium leaves the range — the range
+          only chooses the strike for the NEXT trade.
+        - A side keeps its strike while the premium stays within the range +/-
+          OPTIONS_PREMIUM_BUFFER (95-155): no switching on every tick near 100.
+        - No strike in range: a side keeps the strike it has; at the very start
+          it takes the closest one, with a warning.
+        - Each side on its own: a side with no price yet doesn't hold the other
+          one up. A side that switches continues on the new contract's own
+          candles (replayed from today); the other side is untouched."""
         if self.band_frozen:
             return
         cfg = self.config
@@ -1185,31 +1190,27 @@ class OptionsEngine:
             cur = self.call_strike if side == "CE" else self.put_strike
             q = ((chain.legs or {}).get(cur) or {}).get(side.lower()) if cur is not None else None
             price = getattr(q, "last_price", 0.0) or 0.0
-            otm = cur is not None and (cur < chain.spot if side == "PE" else cur > chain.spot)
-            if otm and (price <= 0 or lo - buf <= price <= hi + buf):
+            if cur is not None and (price <= 0 or lo - buf <= price <= hi + buf):
                 new[side] = cur                       # still fits (or no price this poll): keep it
                 continue
             pick = pick_strike(chain, side, lo, hi, cfg.strike_step)
-            if pick is None:
-                new[side] = cur
+            if pick is None or (cur is not None and not pick[2]):
+                new[side] = cur                       # nothing (better) in range: keep what it has
                 continue
             strike, prem, inside = pick
-            if not inside and otm:
-                new[side] = cur                       # nothing better in range: keep what it has
-                continue
             new[side] = strike
             if strike != cur:
-                notes.append(f"{side} {strike:.0f} (Rs {prem:.2f}{'' if inside else ', NOT in range'})")
+                was = f"{cur:.0f} (Rs {price:.2f}) -> " if cur is not None else ""
+                notes.append(f"{side} {was}{strike:.0f} (Rs {prem:.2f}{'' if inside else ', NOT in range'})")
                 if not inside:
-                    logger.warning("[%-2s] no out-of-the-money strike has a premium of Rs %g-%g — using %.0f "
-                                   "(Rs %.2f), the closest.", side, lo, hi, strike, prem)
+                    logger.warning("[%-2s] no strike has a premium of Rs %g-%g — using %.0f (Rs %.2f), the closest.",
+                                   side, lo, hi, strike, prem)
         if new["PE"] == self.put_strike and new["CE"] == self.call_strike:
             return
-        logger.info("Strikes picked by premium (OTM, Rs %g-%g, farthest): %s | spot %.2f",
-                    lo, hi, " / ".join(notes), chain.spot)
+        logger.info("Strikes picked by premium (Rs %g-%g): %s | NIFTY %.2f", lo, hi, " / ".join(notes), chain.spot)
         changed = [s for s in _LEGS if new[s] != (self.call_strike if s == "CE" else self.put_strike)]
         self.put_strike, self.call_strike = new["PE"], new["CE"]
-        for side in changed:                          # a new contract: its own history, a fresh pattern
+        for side in changed:                          # a new contract: its own candles, its own pattern
             self.legs[side] = self._new_leg(side)
 
     async def _ensure_contract_async(self, side: str, leg: LegState) -> None:
@@ -1436,6 +1437,12 @@ class OptionsEngine:
     def _trades_today(self, side: str) -> int:
         n = sum(1 for t in self.ledger.get_today_trades() if t.get("leg") == side)
         return n + (1 if self.legs[side].position is not None else 0)
+
+    def _trades_today_total(self) -> int:
+        """Trades opened today, CE and PE together (a partly closed trade counts once)."""
+        ids = {str(t.get("trade_id", "")).split("-p")[0] for t in self.ledger.get_today_trades()}
+        ids |= {leg.position.trade_id for leg in self.legs.values() if leg.position is not None}
+        return len(ids)
 
     def _arm_skip_reason(self, side: str, leg: LegState, candle2: Candle) -> Optional[str]:
         """Why candle 2 must NOT get a sell order — the same rules as any entry,
@@ -2025,6 +2032,8 @@ class OptionsEngine:
             return "first candle after start was only partly seen and couldn't be verified"
         if self._entry_in_flight is not None:
             return f"{self._entry_in_flight} entry still being placed (one trade at a time)"
+        if self.config.max_trades_per_day > 0 and self._trades_today_total() >= self.config.max_trades_per_day:
+            return f"{self.config.max_trades_per_day} trades already today - no more today"
         if self.config.max_daily_loss > 0 and self.realized_pnl <= -self.config.max_daily_loss:
             return (f"daily loss limit reached (net Rs {self.realized_pnl:.2f}, "
                     f"limit Rs -{self.config.max_daily_loss:.0f})")

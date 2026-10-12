@@ -12,14 +12,14 @@ orders**, recording everything in a local SQLite ledger.
 
 ## Strategy
 
-1. **Strikes** — by premium (`OPTIONS_STRIKE_PICK=premium`): each side trades an
-   **out-of-the-money** strike (PE below NIFTY, CE above) whose premium is
-   **₹100–150** — the farthest one. NIFTY 22,233: PE 22100 ₹128 / 22000 ₹104 →
-   **PE 22000**; CE 22400 ₹135 / 22500 ₹106 → **CE 22500**. A side keeps its strike
-   until the premium leaves ₹95–155, and never switches while a trade or order
-   is open or a pattern is waiting — the range only picks the strike for the
-   next trade, it never closes one. (`spot` = the old way: PUT = NIFTY rounded
-   down to the hundred, CALL = +100.)
+1. **Strikes** — by premium (`OPTIONS_STRIKE_PICK=premium`): CE and PE are picked
+   **separately**, each the strike whose premium is **₹100–150** — in or out of
+   the money doesn't matter. Several in range → the one closest to ₹125.
+   NIFTY 22,233: CE 22100 ₹145 / CE 22200 ₹112 → **CE 22200**. A side keeps its
+   strike until its premium leaves ₹95–155, and never switches while a trade or
+   order is open or a pattern is waiting — the range only picks the strike for
+   the next trade, it never closes one. Checked every ~5 s. (`spot` = PUT = NIFTY
+   rounded down to the hundred, CALL = +100.)
 2. **Expiry** — the nearest weekly, fixed for the day (0 DTE on expiry day
    unless `OPTIONS_ROLL_ON_EXPIRY_DAY=true`).
 3. **Candles** — live ticks, timed by the exchange's trade time, become
@@ -41,21 +41,22 @@ orders**, recording everything in a local SQLite ledger.
    (or it sells at once if the price is already below). The same side trades
    again only after a GREEN that closes after its exit (the exit candle itself
    counts if it closes GREEN). No new trades after the square-off time or
-   after the daily loss limit; from 09:15.
+   after the daily loss limit; from 09:15. **At most 6 trades a day**, CE and PE
+   together (`OPTIONS_MAX_TRADES_PER_DAY`).
 7. **Stop** — **HA High + 0.5** (`OPTIONS_STOP_OFFSET_POINTS`): candle 2's
    while candles 3 and 4 form, then the HA High from 2 candles back, moved at
    every candle close.
-8. **Profit lock** — first at 8 points, then every 3 points (8, 11, 14, 17, 20 …),
+8. **Profit lock** — first at 20 points, then every 3 points (20, 23, 26, 29 …),
    always one step behind the best (`OPTIONS_PROFIT_LOCK_START_POINTS`,
    `OPTIONS_PROFIT_LOCK_STEP_POINTS`). Live, it sits at the exchange. Sold at 100:
 
    | Lowest price | Points | Buy back at | Points kept |
    |---|---|---|---|
-   | 92 | 8 | 92 | 8 |
-   | 89 | 11 | 92 | 8 |
-   | 86 | 14 | 89 | 11 |
-   | 83 | 17 | 86 | 14 |
-   | 80 | 20 | 83 | 17 |
+   | 85 | 15 | no lock yet (only the HA stop) | — |
+   | 80 | 20 | 80 | 20 |
+   | 77 | 23 | 80 | 20 |
+   | 74 | 26 | 77 | 23 |
+   | 71 | 29 | 74 | 26 |
 9. **Exit** — stop hit, profit lock hit, or everything bought back at **15:10**
    (`OPTIONS_SQUAREOFF_AT`).
 10. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST

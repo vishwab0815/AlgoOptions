@@ -215,9 +215,12 @@ def _print_banner(config) -> None:
         f"│  {'gates':<18} pattern only — no RSI, no volume filter",
         (f"│  {'doji':<18} HA body <= {config.doji_body_pct:g}% of the candle's height = neither colour, "
          f"skipped while waiting for candle 1 / 2" if config.doji_body_pct > 0 else f"│  {'doji':<18} off"),
-        (f"│  {'strikes':<18} out of the money, premium Rs {config.premium_min:g}-{config.premium_max:g} "
-         f"(the farthest); kept until it leaves {config.premium_min - config.premium_buffer:g}-"
-         f"{config.premium_max + config.premium_buffer:g}; never while a trade/order is open"
+        f"│  {'trades/day':<18} " + (f"at most {config.max_trades_per_day} (CE + PE together)"
+                                     if config.max_trades_per_day else "no limit"),
+        (f"│  {'strikes':<18} CE and PE each: premium Rs {config.premium_min:g}-{config.premium_max:g} "
+         f"(in or out of the money, closest to {(config.premium_min + config.premium_max) / 2:g}); kept until it "
+         f"leaves {config.premium_min - config.premium_buffer:g}-{config.premium_max + config.premium_buffer:g}; "
+         f"never while a trade/order is open"
          if config.strike_pick == "premium" else
          f"│  {'strike band':<18} floor-hundred(spot) / +100, frozen while a leg is open"),
         f"│  {'sequencing':<18} one trade at a time; then either leg (same leg needs a fresh pattern)",
