@@ -27,9 +27,7 @@ orders**, recording everything in a local SQLite ledger.
    Heikin-Ashi series continues from previous days (like a chart); the
    opening candle is fetched complete.
 4. **Pattern**, on each side's own premium (CE and PE watched all day):
-   candle 1 GREEN, then candle 2 RED. A **doji** (HA body at most 5% of the
-   candle's height, `OPTIONS_DOJI_BODY_PCT`) is neither colour: while waiting
-   for candle 1 or 2 it is skipped — GREEN, doji, RED makes the RED candle 2.
+   candle 1 GREEN, then candle 2 RED (GREEN = HA close above HA open, else RED).
 5. **Sell order** — the moment candle 2 closes, a sell order goes in at
    **candle 2's HA Low − 0.5** (`OPTIONS_ENTRY_OFFSET_POINTS`). It sells when
    the price reaches it during candle 3, and is cancelled when candle 3 ends.

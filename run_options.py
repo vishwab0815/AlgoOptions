@@ -213,8 +213,6 @@ def _print_banner(config) -> None:
          if config.entry_mode == "break" else
          f"│  {'entry':<18} HA GREEN -> RED -> RED breakout at candle 3's close, sell-to-open only"),
         f"│  {'gates':<18} pattern only — no RSI, no volume filter",
-        (f"│  {'doji':<18} HA body <= {config.doji_body_pct:g}% of the candle's height = neither colour, "
-         f"skipped while waiting for candle 1 / 2" if config.doji_body_pct > 0 else f"│  {'doji':<18} off"),
         f"│  {'trades/day':<18} " + (f"at most {config.max_trades_per_day} (CE + PE together)"
                                      if config.max_trades_per_day else "no limit"),
         (f"│  {'strikes':<18} CE and PE each: premium Rs {config.premium_min:g}-{config.premium_max:g} "

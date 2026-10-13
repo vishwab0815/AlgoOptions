@@ -1276,9 +1276,6 @@ class OptionsEngine:
                 logger.info("%s || 3/3 TRIGGER — broke %.2f (history only, not traded)", base, level)
             else:
                 logger.info("%s || 3/3 TRIGGER — broke %.2f, signal", base, level)
-        elif color == "DOJI" and old_stage != SignalEngine.STAGE_LEVEL_SET:
-            waiting = {SignalEngine.STAGE_GREEN_SEEN: "still 1/3, watch for RED"}.get(old_stage, "waiting for GREEN")
-            logger.info("%s || DOJI        — skipped, %s", base, waiting)
         elif new_stage == SignalEngine.STAGE_GREEN_SEEN:
             logger.info("%s || 1/3 ARMED   — GREEN start, watch for RED", base)
         elif new_stage == SignalEngine.STAGE_LEVEL_SET:
@@ -1299,42 +1296,16 @@ class OptionsEngine:
             signal=decision.signal or "NONE",
         )
 
-    def _is_doji(self, ha_open: float, ha_high: float, ha_low: float, ha_close: float) -> bool:
-        """HA body at most OPTIONS_DOJI_BODY_PCT % of the candle's height (the "+" candle)."""
-        pct = self.config.doji_body_pct
-        if pct <= 0:
-            return False
-        height = ha_high - ha_low
-        return abs(ha_close - ha_open) <= height * pct / 100.0 + 1e-9
-
     def _pattern_step(self, leg: LegState, row) -> Tuple[str, StrategyDecision, Optional[float], str]:
         """One candle through the GREEN -> RED pattern: (colour, decision, level, stage).
-
-        Doji (08-Oct, approved): a candle with almost no body is neither GREEN
-        nor RED. 07-Oct 14:35 CE 22700 closed 0.46 below its open (4.8% of its
-        height) and became candle 2; candle 3 missed its sell price by 1 point
-        and the 104 -> 90 fall after it was never traded.
-          - waiting for candle 1 or candle 2: the doji is skipped — the pattern
-            stays exactly where it was (GREEN, doji, RED -> the RED is candle 2);
-          - as candle 3: judged as usual (the sell order lives for that candle
-            whatever its colour), but it can't start a new pattern.
-        The HA stop is not affected: a doji is still a candle for "2 back"."""
+        Shared by live candle closes and the startup replay, so both always agree.
+        A candle is GREEN when its HA close is above its HA open, otherwise RED."""
         o, h, l, c = (float(row[k]) for k in ("ha_open", "ha_high", "ha_low", "ha_close"))
-        if self._is_doji(o, h, l, c):
-            if leg.setup_stage != SignalEngine.STAGE_LEVEL_SET:
-                pct = 100.0 * abs(c - o) / (h - l) if h > l else 0.0
-                return "DOJI", StrategyDecision(signal=None, trend="Neutral", strength="Weak",
-                                                reason=f"Doji (body {pct:.1f}% of height) - skipped."), \
-                    leg.target_level, leg.setup_stage
-            o = max(o, c)                    # never a starter: candle 3 is only broke / held
-            color = "DOJI"
-        else:
-            color = "GREEN" if c > o else "RED"
         decision, level, stage = _SIGNAL_ENGINE.evaluate_breakout(
             ha_open=o, ha_high=h, ha_close=c, ha_low=l,
             target_breakout_level=leg.target_level, setup_stage=leg.setup_stage, rules=SHORT,
         )
-        return color, decision, level, stage
+        return ("GREEN" if c > o else "RED"), decision, level, stage
 
     async def _on_candle_close(self, side: str, leg: LegState, candle: Candle, squareoff_due: bool,
                                finalized: bool = False, arm_now: bool = True) -> None:

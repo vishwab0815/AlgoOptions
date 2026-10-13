@@ -158,11 +158,6 @@ class OptionsConfig:
     # The parked sell is a stop-limit: once triggered it may fill down to this
     # % below the sell price (so a fast drop still fills).
     entry_limit_buffer_pct: float = 3.0
-    # Doji: a candle whose HA body (|close - open|) is at most this % of its
-    # height (high - low) is neither GREEN nor RED. While waiting for candle 1
-    # or candle 2 it is skipped, as if it wasn't there. 0 = off. 5% is the
-    # standard doji test; on a month of NIFTY option candles it marks 1 in 16.
-    doji_body_pct: float = 5.0
 
     # At most this many trades a day, CE and PE together (0 = no limit).
     max_trades_per_day: int = 6
@@ -232,16 +227,6 @@ def _squareoff(raw: str) -> str:
         raise OptionsConfigError(f"OPTIONS_SQUAREOFF_AT={raw!r} — use a time between 09:20 and 15:15 "
                                  "(Dhan squares off intraday positions itself from about 15:18).")
     return hhmm
-
-
-def _doji_pct(raw: str) -> float:
-    try:
-        v = float(raw)
-    except ValueError:
-        raise OptionsConfigError(f"OPTIONS_DOJI_BODY_PCT={raw!r} is not a number.")
-    if not 0 <= v < 50:
-        raise OptionsConfigError(f"OPTIONS_DOJI_BODY_PCT={raw!r} — use 0 (off) up to 49; 5 is the standard.")
-    return v
 
 
 def _strike_pick(raw: str) -> str:
@@ -367,7 +352,6 @@ def load_options_config() -> OptionsConfig:
         entry_offset_pts=max(0.0, float(os.getenv("OPTIONS_ENTRY_OFFSET_POINTS", "0.5"))),
         stop_offset_pts=max(0.0, float(os.getenv("OPTIONS_STOP_OFFSET_POINTS", "0.5"))),
         entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
-        doji_body_pct=_doji_pct(os.getenv("OPTIONS_DOJI_BODY_PCT", "5")),
         max_trades_per_day=max(0, int(os.getenv("OPTIONS_MAX_TRADES_PER_DAY", "6"))),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
         profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "18"),

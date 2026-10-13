@@ -35,7 +35,7 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `main` | Original strategy (GREEN→RED→RED at candle 3's close), older code |
 | `version-2` / `version-3` | History: early sell order (HA Low − 1 / − 0.5), offsets, 15:10 |
 | `version-4` | v3 + fresh-funds fix, pre-close warm-up, doji rule, strikes by premium (OTM) |
-| **`version-5`** | **Current.** Version 4's strategy unchanged + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
+| **`version-5`** | **Current.** Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
 | `old-strategy` | Local only: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 | `generate_token_automation` | History: nightly token + pipeline (merged into v3+) |
 
@@ -49,8 +49,8 @@ from the one they name. Don't merge between strategy branches unasked.
   closest to ₹125. Kept while the premium stays ₹95–155. Never switched while
   a position, a sell order, an entry in flight or a waiting pattern exists.
   Checked on every option-chain poll (~5 s).
-- **Pattern**: candle 1 GREEN, candle 2 RED (a **doji** — HA body ≤ 5% of its
-  height — is skipped while waiting for candle 1 or 2).
+- **Pattern**: candle 1 GREEN, candle 2 RED (GREEN = HA close above HA open,
+  otherwise RED; there is no doji rule on version-5 — it was removed 13-Oct).
 - **Entry** (`OPTIONS_ENTRY_MODE=break`): when candle 2 closes, a SELL
   stop-limit is parked at the exchange at **candle 2's HA Low − 0.5**; it fills
   during candle 3 or is cancelled when candle 3 ends; if the price is already
