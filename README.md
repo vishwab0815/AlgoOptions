@@ -46,17 +46,17 @@ orders**, recording everything in a local SQLite ledger.
 7. **Stop** — **HA High + 0.5** (`OPTIONS_STOP_OFFSET_POINTS`): candle 2's
    while candles 3 and 4 form, then the HA High from 2 candles back, moved at
    every candle close.
-8. **Profit lock** — first at 20 points, then every 3 points (20, 23, 26, 29 …),
+8. **Profit lock** — first at 18 points, then every 2 points (18, 20, 22, 24 …),
    always one step behind the best (`OPTIONS_PROFIT_LOCK_START_POINTS`,
    `OPTIONS_PROFIT_LOCK_STEP_POINTS`). Live, it sits at the exchange. Sold at 100:
 
    | Lowest price | Points | Buy back at | Points kept |
    |---|---|---|---|
-   | 85 | 15 | no lock yet (only the HA stop) | — |
-   | 80 | 20 | 80 | 20 |
-   | 77 | 23 | 80 | 20 |
-   | 74 | 26 | 77 | 23 |
-   | 71 | 29 | 74 | 26 |
+   | 83 | 17 | no lock yet (only the HA stop) | — |
+   | 82 | 18 | 82 | 18 |
+   | 80 | 20 | 82 | 18 |
+   | 78 | 22 | 80 | 20 |
+   | 76 | 24 | 78 | 22 |
 9. **Exit** — stop hit, profit lock hit, or everything bought back at **15:10**
    (`OPTIONS_SQUAREOFF_AT`).
 10. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST

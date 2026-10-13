@@ -35,7 +35,7 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `main` | Original strategy (GREEN→RED→RED at candle 3's close), older code |
 | `version-2` / `version-3` | History: early sell order (HA Low − 1 / − 0.5), offsets, 15:10 |
 | `version-4` | v3 + fresh-funds fix, pre-close warm-up, doji rule, strikes by premium (OTM) |
-| **`version-5`** | **Current.** Version 4's strategy unchanged + strikes by premium ₹100–150 (any moneyness) + profit lock 20/3 + max 6 trades a day |
+| **`version-5`** | **Current.** Version 4's strategy unchanged + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
 | `old-strategy` | Local only: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 | `generate_token_automation` | History: nightly token + pipeline (merged into v3+) |
 
@@ -61,8 +61,8 @@ from the one they name. Don't merge between strategy branches unasked.
 - **Stop**: HA High + 0.5 — candle 2's while candles 3–4 form, then the HA High
   2 candles back, moved every close. Live it rests at the exchange as a BUY
   stop-limit (limit +10%); not filled 3 s after crossing → market buy.
-- **Profit lock 20/3**: first lock at 20 points, then every 3, one step behind
-  (sold 100: 80→80, 77→80, 74→77). Parked at the exchange when tighter.
+- **Profit lock 18/2**: first lock at 18 points, then every 2, one step behind
+  (sold 100: 82→82, 80→82, 78→80, 76→78). Parked at the exchange when tighter.
 - **Limits**: max 6 trades/day (CE+PE), 1 lot live, daily loss limit
   (`OPTIONS_MAX_DAILY_LOSS`), same side needs a fresh GREEN after its exit,
   entries from 09:15, square-off at **15:10**, engine auto-stops 15:31.
