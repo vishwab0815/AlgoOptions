@@ -35,7 +35,8 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `main` | Original strategy (GREEN→RED→RED at candle 3's close), older code |
 | `version-2` / `version-3` | History: early sell order (HA Low − 1 / − 0.5), offsets, 15:10 |
 | `version-4` | v3 + fresh-funds fix, pre-close warm-up, doji rule, strikes by premium (OTM) |
-| **`version-5`** | **Current.** Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
+| `version-5` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
+| **`aiagent-version-6`** | **Current.** version-5 + the AI options strategist (`algopilot/agent`): analyses at 1/3, can block the sell at 2/3 |
 | `old-strategy` | Local only: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 | `generate_token_automation` | History: nightly token + pipeline (merged into v3+) |
 
@@ -71,6 +72,16 @@ Every setting lives in `.env`; `.env.example` lists all of them with comments,
 in the same order. When you add a setting, add it to both and to `config.py`
 with validation.
 
+## 3b. The AI strategist (`aiagent-version-6`, `OPTIONS_AI_AGENT=true`)
+
+- **1/3 (GREEN candle):** `TradeAgent.prepare()` builds a market snapshot in code (`agent/features.py`) and asks Claude Opus 5.5 in the background for SELL/SKIP, a 0–100 confidence and reasons, as structured JSON.
+- **2/3 (sell order due):** `TradeAgent.decide()` reuses a fresh 1/3 answer, or re-checks within `OPTIONS_AI_DECIDE_TIMEOUT_SECS`. The order goes in only for SELL with confidence ≥ `OPTIONS_AI_MIN_CONFIDENCE`. The gate is in `engine._arm`, plus `_arm_best` when both sides are ready.
+- **The agent may only block a sell.** It never places, moves or closes orders.
+- **Any failure follows the pattern** (fail-open): timeout, API error, budget used up.
+- **Never add an extra option-chain request.** The engine hands its polls to the agent (`dhan_client.last_chain_payload`).
+- **Tests must set `ai_agent=False`,** or use a fake LLM. Never call the paid API from tests.
+- **Key and spend:** `ANTHROPIC_API_KEY` lives only in `.env`. Spend is capped per day by `OPTIONS_AI_DAILY_BUDGET_USD`, and every call's tokens and $ are logged.
+
 ## 4. Code map
 
 | Path | Role |
@@ -87,6 +98,7 @@ with validation.
 | `algopilot/options/auto_token.py` | Token from PIN + TOTP |
 | `algopilot/core/` | Candle builder, Heikin-Ashi |
 | `algopilot/strategy/` | GREEN→RED→RED state machine (`signal_engine.py`) |
+| `algopilot/agent/` | AI strategist: `data.py` (Dhan data + chain hand-over), `features.py` (Market Reader), `prompts.py` (rulebook + JSON schema), `llm.py` (Claude calls, cost, budget), `agent.py` (1/3 / 2/3 orchestration) |
 | `algopilot/utils/market_hours.py`, `market_calendar.py` | Session times, square-off time, NSE holidays |
 | `scripts/daily_pipeline.py` | Run-forever automation on the VM (token 21:00, session 08:45) |
 | `scripts/backtest.py` | Replays real Dhan days through the engine (opening spot band only) |

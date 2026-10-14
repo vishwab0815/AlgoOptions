@@ -60,6 +60,43 @@ orders**, recording everything in a local SQLite ledger.
 10. **P&L** — net of brokerage, STT, exchange/SEBI fees, stamp duty and GST
    (rates in `.env`, estimates — check a contract note).
 
+## AI options strategist (`OPTIONS_AI_AGENT=true`)
+
+Every pattern is checked by an AI options strategist before the sell order goes in.
+
+| Moment | What happens |
+|---|---|
+| **1/3** — a GREEN candle on CE or PE | The market is read (below) and **Claude Opus 5.5** judges, in the background, whether selling that side would work if candle 2 turns RED |
+| **2/3** — candle 2 RED, order due | The 1/3 answer is used if it is fresh and NIFTY moved < 20 pts since; otherwise a quick re-check (max 25 s). The order goes in **only if it says SELL with ≥ 60% confidence** |
+
+**The logic it applies:**
+- NIFTY falling → calls fall → selling **CE** is favoured.
+- NIFTY rising → selling **PE** is favoured.
+- Sideways → the pattern often hits the stop, so it needs strong extra evidence.
+
+**What it reads** (the numbers are computed in code and passed to the AI):
+- NIFTY 5-min and 1-min candles: trend, slope, box size.
+- NIFTY futures VWAP and open interest: long or short build-up, short covering.
+- The option chain: walls, fresh open interest in the last 30 min, max pain, expected move, our option's Greeks.
+- India VIX and BANK NIFTY.
+- 60 sessions of history from this time of day.
+- An hourly news brief (Claude Sonnet 5.5 with web search).
+
+**Safety:**
+- It can only **block** a sell. It never places, moves or closes orders.
+- If it is slow, failing or over the daily budget (`OPTIONS_AI_DAILY_BUDGET_USD`), the pattern trades exactly as without it.
+- It reuses the engine's option-chain polls, because Dhan allows one chain request per 3 s.
+- Every analysis and decision, with its reasons, tokens and cost, goes to the log and the ledger (`AI_ANALYSIS`, `AI_DECISION`).
+
+**Cost (measured 14-Oct-2026):**
+
+| Call | Cost |
+|---|---|
+| Strategist call (Opus 5.5) | about $0.027 and 16 s |
+| News brief (Sonnet 5.5, 3 web searches) | about $0.075 |
+
+A normal day comes to about **$1–2**, capped by the daily budget.
+
 ## Live mode
 
 - Entry: a sell stop-limit parked at the exchange at the sell price (fills the
