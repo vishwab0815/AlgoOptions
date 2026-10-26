@@ -1,14 +1,17 @@
 """
-scripts/latency_check.py — how fast can THIS machine talk to Dhan? (read-only)
+scripts/latency_check.py — how fast can THIS machine talk to Zerodha Kite? (read-only)
 
 Places no orders. Measures, from wherever it's run (run it on the VM):
-  - DNS lookup and one network round trip to api.dhan.co
-  - a request on a NEW connection vs an already-OPEN one (the engine keeps
-    the connection open, so orders pay the "open" figure)
-  - connecting and logging in to Dhan's order-update stream (fills pushed)
-  - whether Dhan will accept ORDERS from this machine's IP (static-IP check)
+  - DNS lookup of api.kite.trade
+  - a request on a NEW connection vs an already-OPEN one (the engine keeps the
+    connection open, so orders pay the "open" figure) — GET /user/profile
+  - opening the Kite WebSocket (prices and order updates)
 
     python scripts/latency_check.py
+
+Orders are accepted only from the static IP registered on developers.kite.trade
+(Profile -> IP Whitelist); Kite has no API to check that, so the first live order
+is the real test. Reads (this script) work from any IP.
 """
 import asyncio
 import socket
@@ -19,15 +22,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from algopilot.utils.network import ensure_tls_trust_store, force_ipv4
+from algopilot.utils.network import ensure_tls_trust_store, force_ipv4  # noqa: E402
 
 force_ipv4()
 ensure_tls_trust_store()
 
-import requests
+import requests  # noqa: E402
 
-from algopilot.options.broker import DhanBroker, OrderUpdateStream
-from algopilot.options.config import load_options_config
+from algopilot.options.config import load_options_config  # noqa: E402
+
+HOST = "api.kite.trade"
 
 
 def ms(t0: float) -> float:
@@ -36,45 +40,45 @@ def ms(t0: float) -> float:
 
 def main() -> int:
     cfg = load_options_config()
-    headers = {"access-token": cfg.access_token.get_secret(), "client-id": cfg.client_id, "Accept": "application/json"}
-    url = "https://api.dhan.co/v2/fundlimit"
+    headers = {"X-Kite-Version": "3", "Authorization": f"token {cfg.api_key}:{cfg.access_token.get_secret()}"}
+    t0 = time.perf_counter()
+    ip = socket.getaddrinfo(HOST, 443, socket.AF_INET)[0][4][0]
+    print(f"DNS {HOST} -> {ip}: {ms(t0):.0f} ms")
 
-    t = time.perf_counter(); socket.getaddrinfo("api.dhan.co", 443); dns = ms(t)
-    t = time.perf_counter(); socket.create_connection(("api.dhan.co", 443), timeout=5).close(); rtt = ms(t)
-    cold = []
+    new = []
     for _ in range(3):
-        s = requests.Session(); t = time.perf_counter(); s.get(url, headers=headers, timeout=10); cold.append(ms(t)); s.close()
-    s = requests.Session(); s.get(url, headers=headers, timeout=10); warm = []
-    for _ in range(10):
-        time.sleep(0.3); t = time.perf_counter(); s.get(url, headers=headers, timeout=10); warm.append(ms(t))
-    s.close()
+        t0 = time.perf_counter()
+        r = requests.get(f"https://{HOST}/user/profile", headers=headers, timeout=15)
+        new.append(ms(t0))
+    print(f"GET /user/profile on a NEW connection: {statistics.median(new):.0f} ms (HTTP {r.status_code})")
+    if r.status_code != 200:
+        print(f"  Kite says: {r.text[:200]} — log in: python scripts/kite_login.py")
+        return 2
 
-    async def stream_login() -> float:
-        st = OrderUpdateStream(cfg.client_id, cfg.access_token)
-        task = asyncio.create_task(st.run()); t0 = time.perf_counter()
-        while not st.connected and time.perf_counter() - t0 < 10:
-            await asyncio.sleep(0.01)
-        took = ms(t0) if st.connected else -1.0
-        await st.stop(); task.cancel()
-        return took
-    stream = asyncio.run(stream_login())
+    s = requests.Session()
+    s.headers.update(headers)
+    s.get(f"https://{HOST}/user/profile", timeout=15)
+    kept = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        s.get(f"https://{HOST}/user/profile", timeout=15)
+        kept.append(ms(t0))
+        time.sleep(0.15)
+    print(f"GET /user/profile on an OPEN connection: {statistics.median(kept):.0f} ms (median of 5)")
 
-    b = DhanBroker(cfg.client_id, cfg.access_token)
-    code, ip = b._call("GET", "/ip/getIP"); b.close()
-    ip = ip if code == 200 and isinstance(ip, dict) else {}
+    async def ws_open() -> float:
+        import websockets
+        url = f"wss://ws.kite.trade?api_key={cfg.api_key}&access_token={cfg.access_token.get_secret()}"
+        t0 = time.perf_counter()
+        async with websockets.connect(url, additional_headers={"X-Kite-Version": "3"}, open_timeout=10):
+            return ms(t0)
 
-    w = statistics.median(warm)
-    print("\nDhan latency from this machine")
-    print(f"  DNS lookup                    {dns:7.1f} ms")
-    print(f"  one network round trip        {rtt:7.1f} ms")
-    print(f"  request, NEW connection       {statistics.median(cold):7.1f} ms")
-    print(f"  request, OPEN connection      {w:7.1f} ms   <- what an order costs (engine keeps it open)")
-    print(f"  order-update stream login     {stream:7.1f} ms" if stream >= 0 else "  order-update stream           FAILED to connect")
-    print(f"  orders allowed from this IP   {ip.get('ordersAllowed')}  (this IP {ip.get('detectedIP')}, registered {ip.get('primaryIP')})")
-    if rtt > 20:
-        print("\n  Round trip > 20 ms: a VM in a Mumbai-region data centre would cut every order's time.")
-    if ip and not ip.get("ordersAllowed"):
-        print("\n  *** Dhan will REFUSE orders from this machine — run live only where ordersAllowed is True. ***")
+    try:
+        print(f"Kite WebSocket opened in {asyncio.run(ws_open()):.0f} ms")
+    except Exception as exc:
+        print(f"Kite WebSocket failed: {type(exc).__name__}: {exc}")
+    print("Static IP: orders work only from the IP registered on developers.kite.trade (IPv4, the address "
+          "requests leave from). The first live order confirms it.")
     return 0
 
 

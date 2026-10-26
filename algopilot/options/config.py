@@ -2,7 +2,7 @@
 algopilot/options/config.py — configuration for the NIFTY options engine.
 
 OPTIONS_PAPER_TRADING=true  -> paper: live market data, simulated fills, no order placed.
-OPTIONS_PAPER_TRADING=false -> LIVE: real orders on DhanHQ (see broker.py), real money.
+OPTIONS_PAPER_TRADING=false -> LIVE: real orders on Zerodha Kite Connect (see broker.py), real money.
 Live mode always runs with a daily loss limit (OPTIONS_MAX_DAILY_LOSS, default
 Rs 3,000) after which no new trade is opened.
 
@@ -12,11 +12,9 @@ Heikin-Ashi stop, the profit lock, or the square-off — whichever comes first.
 """
 from __future__ import annotations
 
-import base64
-import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -31,32 +29,12 @@ class OptionsConfigError(RuntimeError):
     """Raised when OPTIONS_* configuration is invalid or missing."""
 
 
-def token_client_id(raw_token: str) -> Optional[str]:
-    """The Dhan client id a JWT access token was issued for (its
-    `dhanClientId` claim), or None if it isn't a JWT we recognise. A token
-    only works together with that exact client id — see load_options_config."""
-    try:
-        payload = raw_token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        return str(json.loads(base64.urlsafe_b64decode(payload))["dhanClientId"])
-    except Exception:
-        return None
-
-
-def token_expiry_ist(raw_token: str) -> Optional[datetime]:
-    """The DhanHQ access token's JWT expiry, in IST — or None if it isn't a
-    JWT we recognise. Used to warn BEFORE a silent disconnect happens: when
-    DhanHQ's WebSocket drops a connection for an expired token, the SDK
-    reports it via a bare print() to stdout (see websocket.py's docstring),
-    which never reaches our log file — this is the proactive alternative,
-    checked once at startup and printed loudly in the banner."""
-    try:
-        payload = raw_token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload))
-        return datetime.fromtimestamp(float(claims["exp"]), timezone.utc).astimezone(_IST)
-    except Exception:
-        return None
+def token_expiry_ist(login_at_raw: str) -> Optional[datetime]:
+    """When today's Kite access token stops working: 06:00 IST after the login
+    (KITE_LOGIN_AT, written by scripts/kite_login.py), or None if unknown. The
+    startup check also asks Kite itself (GET /user/profile) — see run_options.py."""
+    from .kite_auth import expiry_ist, parse_login_at
+    return expiry_ist(parse_login_at(login_at_raw or ""))
 
 
 _CANDLE_TIMEFRAMES = {"1m": 60, "5m": 300}
@@ -76,8 +54,15 @@ def _hhmm(raw: str) -> str:
 
 @dataclass(frozen=True)
 class OptionsConfig:
-    client_id: str
+    api_key: str
     access_token: SecretStr
+    # The Zerodha user id (e.g. AB1234) — shown in the banner; optional.
+    client_id: str = ""
+    # When the day's token was made (scripts/kite_login.py); it works until 06:00 IST next.
+    login_at: str = ""
+    # Kite product for every order: MIS (intraday; Zerodha squares off any MIS
+    # position itself around 15:25) or NRML. The engine squares off at 15:10.
+    product: str = "MIS"
 
     enabled: bool = True
     paper_trading: bool = True
@@ -106,22 +91,21 @@ class OptionsConfig:
     max_lots_per_trade: int = 5
     # Used only until the live scrip master resolves the leg's real,
     # currently-listed lot size (NSE revises this periodically — engine.py
-    # prefers the live value the moment it's available; see dhan_client.py's
-    # ContractInfo). Confirmed against a live scrip-master pull: 65 as of
+    # prefers the live value the moment it's available; see kite_client.py's
+    # ContractInfo, from Zerodha's daily instrument list). Confirmed against a live scrip-master pull: 65 as of
     # this writing, NOT 75 — double-check nseindia.com before relying on it.
     lot_size: int = 65
     db_path: str = "data/options_ledger.db"
 
-    # DhanHQ identity for the NIFTY 50 index (IDX_I segment) — a stable,
-    # published constant, but overridable in case an account ever needs a
-    # different underlying/segment.
-    nifty_security_id: str = "13"
-    nifty_index_segment: str = "IDX_I"
-    option_exchange_segment: str = "NSE_FNO"
+    # Kite identity of the NIFTY 50 index: its tradingsymbol and exchange
+    # (the quote key is "NSE:NIFTY 50"), and the exchange of the options (NFO).
+    nifty_security_id: str = "NIFTY 50"
+    nifty_index_segment: str = "NSE"
+    option_exchange_segment: str = "NFO"
 
-    # Used ONLY when a live DhanHQ margin-calculator lookup cannot be
-    # completed (option security id not resolved yet, or the call fails) —
-    # see dhan_client.py:margin_per_lot(). Always clearly labelled as an
+    # Used ONLY when the live Kite margin calculation (POST /margins/basket)
+    # cannot be completed (contract not resolved yet, or the call fails) —
+    # see kite_client.py:margin_per_lot(). Always clearly labelled as an
     # estimate in logs/ledger, never silently treated as the real figure.
     fallback_margin_per_lot: float = 130000.0
 
@@ -135,12 +119,12 @@ class OptionsConfig:
     # in the final milliseconds, still in flight on the network, is included
     # — at the cost of deciding that much later. 0 = decide at the boundary.
     candle_close_grace_ms: int = 0
-    # Decide each candle on DhanHQ's own 5-minute bar (what the chart shows)
-    # instead of the one built from live-feed ticks. The feed sends snapshots,
-    # not every trade, so it misses highs/lows (30-Sep, CE 10:30-10:35: feed
-    # low 116.75, exchange low 115.35). DhanHQ published each bar ~45 ms after
-    # the close on the VM; if it's later than the wait below, the live-feed
-    # candle is used for that close.
+    # Decide each candle on the broker's own 5-minute bar (what the chart shows;
+    # Kite's historical candles) instead of the one built from live-feed ticks.
+    # The feed sends snapshots, not every trade, so it misses highs/lows (30-Sep,
+    # CE 10:30-10:35: feed low 116.75, exchange low 115.35). If the bar isn't
+    # there within the wait below, the live-feed candle is used for that close;
+    # every bar used is fetched again later and any revision is logged.
     official_candles: bool = True
     official_candle_wait_ms: int = 1500
 
@@ -194,13 +178,13 @@ class OptionsConfig:
     # when no position is open). "" = run until stopped by hand.
     auto_stop_at: str = "15:31"
     # Square-off (HH:MM IST): every open trade is bought back, and no new sell
-    # order whose candle 3 would end at/after it. Must be before Dhan's own
-    # intraday auto square-off (~15:18), so 15:15 at the latest.
+    # order whose candle 3 would end at/after it. Must be well before
+    # Zerodha's own MIS auto square-off (~15:25), so 15:15 at the latest.
     squareoff_at: str = "15:10"
 
     # Cost model applied to every paper fill — see charges.py. Defaults are
     # ESTIMATES of published Indian F&O rates and change with budgets and
-    # exchange circulars; verify against a real Dhan contract note. Without
+    # exchange circulars; verify against a real Zerodha contract note. Without
     # these the engine reports frictionless P&L, which at 1 lot is wrong by
     # roughly Rs 50 a round trip — enough to turn small paper wins into real
     # losses. Set OPTIONS_APPLY_CHARGES=false to see gross numbers instead.
@@ -212,21 +196,19 @@ class OptionsConfig:
     stamp_duty_pct: float = 0.003
     gst_pct: float = 18.0
 
-    # Minimum gap between actual calls to DhanHQ's option-chain endpoints
-    # (chain + expiry list share this — used only for spot/band resolution,
-    # not premiums, which come from the WebSocket feed). DhanHQ documents
-    # "1 req/3s" here, but live testing showed even correctly-3s-spaced
-    # requests can still draw an HTTP 429, so the default is more
-    # conservative, with an additional 15s cool-off automatically applied
-    # after any 429 (see dhan_client.py).
-    chain_min_interval_secs: float = 5.0
+    # Minimum gap between option-chain refreshes. Kite has no chain API: the
+    # chain is one batched GET /quote (every strike of the expiry + the index),
+    # and Kite allows 1 quote call a second — 2 s leaves room, with a 10 s
+    # cool-off after any HTTP 429 (see kite_client.py). Premiums for the two
+    # traded legs stream over the WebSocket; the chain only picks strikes.
+    chain_min_interval_secs: float = 2.0
 
 
 def _squareoff(raw: str) -> str:
     hhmm = _hhmm(raw)
     if not "09:20" <= hhmm <= "15:15":
         raise OptionsConfigError(f"OPTIONS_SQUAREOFF_AT={raw!r} — use a time between 09:20 and 15:15 "
-                                 "(Dhan squares off intraday positions itself from about 15:18).")
+                                 "(Zerodha squares off MIS positions itself from about 15:25).")
     return hhmm
 
 
@@ -258,24 +240,17 @@ def load_options_config() -> OptionsConfig:
     """Load OPTIONS_* configuration from environment variables (.env file)."""
     load_dotenv()
 
-    client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
-    raw_token = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
-    if not client_id:
-        raise OptionsConfigError("Missing DHAN_CLIENT_ID environment variable.")
+    api_key = os.getenv("KITE_API_KEY", "").strip()
+    raw_token = os.getenv("KITE_ACCESS_TOKEN", "").strip()
+    if not api_key:
+        raise OptionsConfigError("Missing KITE_API_KEY (your Kite Connect app's API key, from developers.kite.trade).")
     if not raw_token:
-        raise OptionsConfigError("Missing DHAN_ACCESS_TOKEN environment variable.")
-    token_owner = token_client_id(raw_token)
-    if token_owner is not None and token_owner != client_id:
-        # Every DhanHQ call sends both; a token issued for another account is
-        # rejected with a bare HTTP 401 that reads exactly like an expired
-        # token. Catch it here, by name, before any network call.
-        raise OptionsConfigError(
-            f"DHAN_ACCESS_TOKEN was issued for Dhan client id {token_owner}, but "
-            f"DHAN_CLIENT_ID is {client_id}. They must be the same account — set "
-            f"DHAN_CLIENT_ID={token_owner}, or use a token generated for {client_id}."
-        )
+        raise OptionsConfigError("Missing KITE_ACCESS_TOKEN — log in first: python scripts/kite_login.py")
     access_token = SecretStr(raw_token)
     del raw_token
+    product = os.getenv("OPTIONS_PRODUCT", "MIS").strip().upper()
+    if product not in ("MIS", "NRML"):
+        raise OptionsConfigError(f"OPTIONS_PRODUCT={product!r} — use MIS (intraday) or NRML.")
 
     paper_trading = os.getenv("OPTIONS_PAPER_TRADING", "true").strip().lower() == "true"
     live_order_type = os.getenv("OPTIONS_LIVE_ORDER_TYPE", "MARKET").strip().upper()
@@ -322,13 +297,16 @@ def load_options_config() -> OptionsConfig:
     if strike_step not in (50, 100):
         raise OptionsConfigError(f"OPTIONS_STRIKE_STEP={strike_step} — use 100 or 50.")
 
-    chain_min_interval = float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_SECS", "5.0"))
-    if chain_min_interval <= 0:
-        raise OptionsConfigError("OPTIONS_CHAIN_MIN_INTERVAL_SECS must be positive.")
+    chain_min_interval = float(os.getenv("OPTIONS_CHAIN_MIN_INTERVAL_SECS", "2.0"))
+    if chain_min_interval < 1.0:
+        raise OptionsConfigError("OPTIONS_CHAIN_MIN_INTERVAL_SECS must be at least 1 (Kite: 1 quote call a second).")
 
     return OptionsConfig(
-        client_id=client_id,
+        api_key=api_key,
         access_token=access_token,
+        client_id=os.getenv("KITE_USER_ID", "").strip(),
+        login_at=os.getenv("KITE_LOGIN_AT", "").strip(),
+        product=product,
         enabled=os.getenv("OPTIONS_ENABLED", "true").strip().lower() == "true",
         paper_trading=paper_trading,
         live_max_lots=max(1, int(os.getenv("OPTIONS_LIVE_MAX_LOTS", "1"))),
@@ -343,9 +321,9 @@ def load_options_config() -> OptionsConfig:
         max_lots_per_trade=max_lots,
         lot_size=lot_size,
         db_path=os.getenv("OPTIONS_DB_PATH", "data/options_ledger.db").strip(),
-        nifty_security_id=os.getenv("OPTIONS_NIFTY_SECURITY_ID", "13").strip(),
-        nifty_index_segment=os.getenv("OPTIONS_NIFTY_SEGMENT", "IDX_I").strip(),
-        option_exchange_segment=os.getenv("OPTIONS_EXCHANGE_SEGMENT", "NSE_FNO").strip(),
+        nifty_security_id=os.getenv("OPTIONS_NIFTY_INDEX", "NIFTY 50").strip(),
+        nifty_index_segment=os.getenv("OPTIONS_NIFTY_INDEX_EXCHANGE", "NSE").strip(),
+        option_exchange_segment=os.getenv("OPTIONS_OPTION_EXCHANGE", "NFO").strip(),
         fallback_margin_per_lot=float(os.getenv("OPTIONS_FALLBACK_MARGIN_PER_LOT", "130000.0")),
         candle_close_grace_ms=max(0, int(os.getenv("OPTIONS_CANDLE_CLOSE_GRACE_MS", "0"))),
         official_candles=os.getenv("OPTIONS_OFFICIAL_CANDLES", "true").strip().lower() == "true",

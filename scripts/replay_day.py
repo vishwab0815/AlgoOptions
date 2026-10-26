@@ -4,12 +4,13 @@ scripts/replay_day.py — replay a real trading day through the real engine (PAP
     python scripts/replay_day.py 2026-10-23
     python scripts/replay_day.py 2026-10-23 OPTIONS_PREMIUM_MIN=100 OPTIONS_PREMIUM_MAX=150 OPTIONS_PROFIT_LOCK_START_POINTS=18
 
-The day's real 1-minute data comes from DhanHQ's data API (NIFTY, and every
-option strike of the nearest weekly expiry around the day's range). No orders,
-no option-chain requests. The OptionsEngine then runs that day minute by
-minute on a virtual clock — strike picking, Heikin-Ashi candles, the pattern,
-the sell order at candle-2 HA Low - 0.5, the stop, the profit lock, the 15:10
-square-off — in PAPER mode with a temporary ledger (never data/options_ledger.db).
+The day's real 1-minute candles come from Zerodha Kite Connect's historical API
+(NIFTY 50, and every option strike of that day's weekly expiry around the day's
+range, from today's instrument list). No orders, no quote polling. The
+OptionsEngine then runs that day minute by minute on a virtual clock — strike
+picking, Heikin-Ashi candles, the pattern, the sell order at candle-2 HA Low -
+0.5, the stop, the profit lock, the 15:10 square-off — in PAPER mode with a
+temporary ledger (never data/options_ledger.db).
 
 Settings come from .env; KEY=VALUE arguments override them for this run only
 (e.g. to compare against version-5's 100-150 / 18-2).
@@ -19,13 +20,13 @@ data/replay/replay_<day>.log. Downloaded data is cached in data/replay/.
 
 Limits: fills are simulated on 1-minute bars (the path open -> low -> high ->
 close, or open -> high -> low -> close); the real engine sees every tick.
-Margin is assumed available. Weeks that have expired come from Dhan's
-expired-options API (rolling ATM offsets).
+Margin is assumed available. Kite serves candles only for contracts that are
+still listed: days of an EXPIRED weekly series can't be replayed (the script
+says so instead of quietly using the wrong week's contracts).
 """
 from __future__ import annotations
 
 import asyncio
-import csv
 import json
 import logging
 import os
@@ -33,7 +34,6 @@ import sys
 import tempfile
 import time as _time
 import types
-from collections import defaultdict
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -51,7 +51,6 @@ force_ipv4()
 ensure_tls_trust_store()
 
 import pandas as pd  # noqa: E402
-import requests  # noqa: E402
 from dotenv import dotenv_values  # noqa: E402
 
 import algopilot.options.engine as E  # noqa: E402
@@ -59,96 +58,77 @@ import algopilot.options.ledger as LG  # noqa: E402
 import algopilot.utils.market_hours as MH  # noqa: E402
 from algopilot.core.candle_builder import Candle  # noqa: E402
 from algopilot.options.config import load_options_config  # noqa: E402
-from algopilot.options.dhan_client import ChainSnapshot, LegQuote  # noqa: E402
+from algopilot.options.instruments import InstrumentRegistry  # noqa: E402
+from algopilot.options.kite_api import KiteHTTP  # noqa: E402
+from algopilot.options.kite_client import ChainSnapshot, LegQuote  # noqa: E402
+from algopilot.utils.secrets import SecretStr  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
 OUT = Path("data/replay")
-_CHARTS = "https://api.dhan.co/v2/charts/intraday"
-_ROLLING = "https://api.dhan.co/v2/charts/rollingoption"
-_SCRIP = Path("data/dhan_scrip_master.csv")
+NIFTY_50_TOKEN = 256265
 _STRIKE_SPAN = 1000          # strikes fetched: the day's NIFTY range +/- this many points
 
 
-# ── fetching one day ────────────────────────────────────────────────────────
+# ── fetching one day (Kite historical candles) ──────────────────────────────
 class Fetcher:
     def __init__(self) -> None:
         env = dotenv_values(".env")
-        self.s = requests.Session()
-        self.s.headers.update({"access-token": env.get("DHAN_ACCESS_TOKEN", ""), "client-id": env.get("DHAN_CLIENT_ID", ""),
-                               "Content-Type": "application/json", "Accept": "application/json"})
+        self.http = KiteHTTP(str(env.get("KITE_API_KEY") or ""), SecretStr(str(env.get("KITE_ACCESS_TOKEN") or "")),
+                             timeout=30.0)
+        self.registry = InstrumentRegistry(self.http)
         self.calls = 0
-        self.rows = list(csv.DictReader(open(_SCRIP, encoding="utf-8"))) if _SCRIP.exists() else []
 
-    def post(self, url: str, body: dict) -> dict:
-        r = None
-        for i in range(4):
-            r = self.s.post(url, json=body, timeout=60)
-            _time.sleep(0.4)
-            self.calls += 1
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (401, 403):
-                raise RuntimeError(f"Dhan refused the token (HTTP {r.status_code}) — update DHAN_ACCESS_TOKEN in .env")
-            _time.sleep(2 + 2 * i)
-        raise RuntimeError(f"Dhan {r.status_code}: {r.text[:160]}")
-
-    def bars(self, sid, seg, inst, interval, frm, to, oi=False) -> dict:
-        return self.post(_CHARTS, {"securityId": str(sid), "exchangeSegment": seg, "instrument": inst, "interval": interval,
-                                   "oi": oi, "fromDate": frm.strftime("%Y-%m-%d %H:%M:%S"),
-                                   "toDate": to.strftime("%Y-%m-%d %H:%M:%S")})
+    def candles(self, token: int, interval: str, frm: datetime, to: datetime, oi: bool = False) -> dict:
+        """Kite candles as {timestamp, open, high, low, close, volume[, open_interest]} lists."""
+        self.calls += 1
+        reply = self.http.call("GET", f"/instruments/historical/{int(token)}/{interval}", family="historical",
+                               params={"from": frm.strftime("%Y-%m-%d %H:%M:%S"), "to": to.strftime("%Y-%m-%d %H:%M:%S"),
+                                       "continuous": 0, "oi": 1 if oi else 0})
+        if not reply.ok:
+            if self.http.auth_failed or reply.status in (400, 403):
+                raise RuntimeError(f"Kite refused the request ({reply.reason()}) — log in: python scripts/kite_login.py")
+            raise RuntimeError(f"Kite candles for {token}: {reply.reason()}")
+        out = {k: [] for k in ("timestamp", "open", "high", "low", "close", "volume")}
+        if oi:
+            out["open_interest"] = []
+        for c in (reply.data or {}).get("candles") or []:
+            out["timestamp"].append(int(datetime.strptime(c[0], "%Y-%m-%dT%H:%M:%S%z").timestamp()))
+            for i, k in enumerate(("open", "high", "low", "close", "volume"), start=1):
+                out[k].append(float(c[i]))
+            if oi:
+                out["open_interest"].append(float(c[6]) if len(c) > 6 else 0.0)
+        return out
 
     def day(self, d: date) -> dict:
         D = datetime(d.year, d.month, d.day, tzinfo=IST)
         day0, day1 = D.replace(hour=9), D.replace(hour=15, minute=30)
         ds = d.isoformat()
-        raw = {"day": ds, "nifty_1m": self.bars(13, "IDX_I", "INDEX", "1", day0, day1)}
-        if not raw["nifty_1m"].get("timestamp"):
-            raise RuntimeError(f"{ds}: no NIFTY bars (holiday or weekend?)")
+        raw = {"day": ds, "nifty_1m": self.candles(NIFTY_50_TOKEN, "minute", day0, day1)}
+        if not raw["nifty_1m"]["timestamp"]:
+            raise RuntimeError(f"{ds}: no NIFTY 50 candles (holiday, weekend, or not yet traded)")
+        self.registry.ensure()
+        expiries = [e for e in self.registry.expiries() if e >= ds]
+        if not expiries:
+            raise RuntimeError("no listed NIFTY expiry on or after that day")
+        exp = expiries[0]
+        if (date.fromisoformat(exp) - d).days > 7:
+            raise RuntimeError(f"{ds}'s weekly series has expired and Kite no longer serves it (the nearest listed "
+                               f"expiry is {exp}). Only days of a still-listed expiry can be replayed.")
+        raw["expiry"] = exp
         lo, hi = min(raw["nifty_1m"]["low"]), max(raw["nifty_1m"]["high"])
         k_lo, k_hi = int(lo // 100 * 100) - _STRIKE_SPAN, int(hi // 100 * 100) + _STRIKE_SPAN
-        opts = sorted((r["SM_EXPIRY_DATE"], r["SECURITY_ID"], r) for r in self.rows
-                      if r.get("UNDERLYING_SYMBOL") == "NIFTY" and r.get("INSTRUMENT") == "OPTIDX"
-                      and r.get("SM_EXPIRY_DATE", "") >= ds)
         raw["options"] = {}
-        if opts:
-            exp = opts[0][0]
-            raw["expiry"] = exp
-            for e, sid, r in opts:
-                k = float(r["STRIKE_PRICE"])
-                if e != exp or not (k_lo <= k <= k_hi) or k % 100:
-                    continue
-                m1 = self.bars(sid, "NSE_FNO", "OPTIDX", "1", day0, day1, oi=True)
-                if not m1.get("timestamp"):
-                    continue
-                raw["options"][f"{int(k)}{r['OPTION_TYPE']}"] = {
-                    "m1": m1, "m5_hist": self.bars(sid, "NSE_FNO", "OPTIDX", "5", D - timedelta(days=6), day0)}
-        if len(raw["options"]) < 10:                       # an expired week: the expired-options API
-            raw["expiry"] = (d + timedelta(days=(1 - d.weekday()) % 7)).isoformat()
-            raw["options"] = self.rolling(d)
-        return raw
-
-    def rolling(self, d: date) -> dict:
-        series = defaultdict(dict)
-        for side, flag in (("CE", "CALL"), ("PE", "PUT")):
-            for off in range(-10, 11):
-                x = (self.post(_ROLLING, {
-                    "exchangeSegment": "NSE_FNO", "interval": "1", "securityId": 13, "instrument": "OPTIDX",
-                    "expiryFlag": "WEEK", "expiryCode": 1, "strike": "ATM" if off == 0 else f"ATM{off:+d}",
-                    "drvOptionType": flag, "requiredData": ["open", "high", "low", "close", "volume", "oi", "strike"],
-                    "fromDate": d.isoformat(), "toDate": d.isoformat()}).get("data") or {}).get(side.lower()) or {}
-                for i, ts in enumerate(x.get("timestamp") or []):
-                    k = float(x["strike"][i])
-                    if k % 100 == 0:
-                        series[(k, side)][ts] = (x["open"][i], x["high"][i], x["low"][i], x["close"][i],
-                                                 x["volume"][i], x["oi"][i])
-        out = {}
-        for (k, side), s in series.items():
-            if len(s) < 200:
+        for ins in sorted(self.registry.chain(exp), key=lambda i: (i.strike, i.instrument_type)):
+            if not (k_lo <= ins.strike <= k_hi) or ins.strike % 100:
                 continue
-            ts = sorted(s)
-            out[f"{int(k)}{side}"] = {"m5_hist": {}, "m1": {"timestamp": ts, **{f: [s[t][j] for t in ts] for j, f in enumerate(
-                ("open", "high", "low", "close", "volume", "open_interest"))}}}
-        return out
+            m1 = self.candles(ins.token, "minute", day0, day1, oi=True)
+            if not m1["timestamp"]:
+                continue
+            raw["options"][f"{int(ins.strike)}{ins.instrument_type}"] = {
+                "m1": m1, "m5_hist": self.candles(ins.token, "5minute", D - timedelta(days=6), day0)}
+        if len(raw["options"]) < 10:
+            raise RuntimeError(f"{ds}: only {len(raw['options'])} option series came back for expiry {exp}")
+        return raw
 
 
 # ── the virtual clock ───────────────────────────────────────────────────────
@@ -211,7 +191,7 @@ class Day:
 
 
 class SimClient:
-    """The engine's Dhan client during a replay: candles from the day's data, margin always available."""
+    """The engine's Kite client during a replay: candles from the day's data, margin always available."""
     auth_failed = False
 
     def __init__(self, day: Day) -> None:

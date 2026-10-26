@@ -37,7 +37,7 @@ class OpenPosition:
     entry_price: float = 0.0
     qty: int = 0
     entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    entry_order_id: str = ""      # paper-fill id, or the real Dhan order id in live mode
+    entry_order_id: str = ""      # paper-fill id, or the real Kite order id in live mode
     cover_level: float = 0.0      # 0.0 = no trailing cover level set yet
     # ── profit lock (see profit_lock_level) ──────────────────────────────────
     best_price: float = 0.0       # lowest premium seen since entry (0 = none yet)

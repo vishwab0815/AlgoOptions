@@ -3,7 +3,7 @@ algopilot/options/engine.py — OptionsEngine: NIFTY premium-selling PAPER
 TRADING composition root.
 
 Real-time pipeline:
-    WebSocket tick (CE/PE premium, pushed by DhanHQ — see websocket.py)
+    WebSocket tick (CE/PE premium, pushed by Kite — see websocket.py)
         -> per-leg CandleBuilder -> HeikinAshiEngine
         -> SignalEngine.evaluate_breakout (GREEN->RED->RED, on THIS leg's own
            premium) — advanced for BOTH legs on every candle close
@@ -28,7 +28,7 @@ maintenance_tick(). It never gates entries or exits; those run off the
 WebSocket feed for minimal lag.
 
 Startup is never pattern-blind: the moment a leg's contract resolves, its
-real intraday candles for today so far are pulled from DhanHQ and replayed
+real intraday candles for today so far are pulled from Kite and replayed
 through the same Heikin-Ashi/pattern logic (see _backfill_leg()) — no live
 entries fire from this replay, it only seeds setup_stage/target_level so the
 first LIVE candle continues the day's real story instead of starting fresh.
@@ -41,7 +41,7 @@ Guarded by trading day, so a fresh day never resurrects yesterday's state.
 
 Paper mode (OPTIONS_PAPER_TRADING=true) simulates every fill at the
 live-quoted premium. Live mode (false) sends real orders through
-broker.DhanBroker — every live branch is gated on `self.broker is not None`.
+broker.KiteBroker — every live branch is gated on `self.broker is not None`.
 """
 from __future__ import annotations
 
@@ -62,9 +62,9 @@ from ..strategy.direction import SHORT
 from ..strategy.signal_engine import SignalEngine, StrategyDecision
 from ..utils.market_hours import get_market_status, set_squareoff_time
 from .config import OptionsConfig
-from .dhan_client import OptionsDhanClient
+from .kite_client import OptionsKiteClient
 from .ledger import OptionsLedger
-from .broker import DhanBroker, OrderResult, OrderUpdateStream, new_tag, to_tick
+from .broker import KiteBroker, OrderResult, OrderUpdateStream, new_tag, to_tick
 from .charges import ChargeRates, round_trip_charges
 from .position import OpenPosition, profit_lock_level, trailing_exit_level
 from .websocket import OptionsWebSocketManager
@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 
 _IST = ZoneInfo("Asia/Kolkata")
 _LEGS = ("CE", "PE")
-_NSE_FNO_SEGMENT_CODE = 2  # dhanhq.marketfeed.MarketFeed.NSE_FNO
+_NSE_FNO_SEGMENT_CODE = 2  # Kite segment code of NFO (instrument_token & 0xFF); the feed uses the token only
 
 # evaluate_breakout() never reads self.config — it is pure, direction-driven
 # state-machine logic — so no config object is needed here.
@@ -149,12 +149,12 @@ _WARM_BEFORE_SECS = 2.0
 # already enough — the seed's influence halves with every candle.
 _HA_SEED_LOOKBACK_DAYS = 5
 
-# Fetching DhanHQ's bar for a candle that just closed (see _finalize_candle).
+# Fetching Kite's bar for a candle that just closed (see _finalize_candle).
 # The half-formed candle at start MUST be completed, so it waits longer.
-# Asking every 0.5 s keeps two legs within Dhan's 5 requests/s data limit.
+# Asking every 0.5 s keeps two legs within Kite's 3 candle requests/s limit.
 _PARTIAL_FETCH_MAX_SECS = 5.0
 _BAR_FETCH_POLL_SECS = 0.5
-# How long after using a bar to fetch it again and check Dhan didn't revise it.
+# How long after using a bar to fetch it again and check Zerodha didn't revise it.
 _BAR_RECHECK_SECS = 20.0
 
 # Kill switch: create this file (any content) and the engine squares off
@@ -167,17 +167,17 @@ STOP_FILE = Path("data/STOP")
 
 # Live mode: how often the broker's available funds are re-read (seconds).
 _FUNDS_REFRESH_SECS = 60.0
-# Right after our own trade exits or our own sell order is cancelled, Dhan frees
+# Right after our own trade exits or our own sell order is cancelled, Zerodha frees
 # that margin a moment later. If a fresh read still can't cover 1 lot within
 # this many seconds of such a release, read again (up to N times, this far apart).
 _FUNDS_RELEASE_WINDOW_SECS = 5.0
 _FUNDS_RETRIES = 3
 _FUNDS_RETRY_GAP_SECS = 0.3
 
-# Live mode: how often an open position is checked against Dhan's positions,
-# to notice a position closed OUTSIDE the engine (by hand in the Dhan app).
+# Live mode: how often an open position is checked against Zerodha's positions,
+# to notice a position closed OUTSIDE the engine (by hand in the Kite app).
 _POSITION_CHECK_SECS = 5.0
-# Dhan's positions can lag an order fill by a few seconds (30-Sep: net 0 shown
+# Zerodha's positions can lag an order fill by a few seconds (30-Sep: net 0 shown
 # 2 s after the 14:15 SELL filled). No conclusion is drawn from positions for
 # a contract the engine had a fill in within this window, and "flat" must be
 # seen on two reads this far apart before a trade is booked as closed outside.
@@ -187,7 +187,7 @@ _FLAT_CONFIRM_SECS = 1.0
 _CANCEL_SETTLE_SECS = 3.0
 _ORDER_DONE = ("CANCELLED", "TRADED", "REJECTED", "EXPIRED")
 # Version-2 entry (entry_mode="break"): how often the parked sell's status is
-# also asked over REST (Dhan PUSHES fills; this is the fallback), and how long a
+# also asked over REST (Zerodha PUSHES fills; this is the fallback), and how long a
 # partly filled sell gets to complete before the rest is cancelled.
 _ARM_POLL_SECS = 0.5
 _PART_FILL_WAIT_SECS = 2.0
@@ -243,7 +243,7 @@ class LegState:
     # The candle that was already half-formed when this leg started receiving
     # ticks (engine start, restart, or a strike change). The live feed only
     # sees its second half, so at its close the complete bar is fetched from
-    # DhanHQ before it's evaluated — see _finalize_candle().
+    # Kite before it's evaluated — see _finalize_candle().
     partial_bucket: Optional[datetime] = None
     # Set when that fetch failed: the candle still feeds the pattern, but a
     # signal on it is not traded (its prices couldn't be verified).
@@ -288,9 +288,8 @@ class OptionsEngine:
     def __init__(self, config: OptionsConfig) -> None:
         self.config = config
         set_squareoff_time(config.squareoff_at)
-        self.client = OptionsDhanClient(
-            client_id=config.client_id,
-            access_token=config.access_token,
+        self.client = OptionsKiteClient(
+            config.api_key, config.access_token, product=config.product,
             chain_min_interval_secs=config.chain_min_interval_secs,
         )
         self.ledger = OptionsLedger(config.db_path)
@@ -327,23 +326,24 @@ class OptionsEngine:
         # LIVE ORDERS: only constructed when OPTIONS_PAPER_TRADING=false (and
         # the confirm phrase is set — see config.py). Every live branch below
         # is gated on `self.broker is not None`, so paper mode is untouched.
-        self.broker: Optional[DhanBroker] = None if config.paper_trading else DhanBroker(
-            config.client_id, config.access_token, config.option_exchange_segment,
+        self.broker: Optional[KiteBroker] = None if config.paper_trading else KiteBroker(
+            config.api_key, config.access_token, self.client.registry,
+            exchange=config.option_exchange_segment, product=config.product,
         )
         self._broker_funds: Optional[float] = None
         self._funds_checked_at = 0.0
         # The funds figure goes stale the moment our own fill / exit / cancel
-        # changes what Dhan holds back; the next entry then reads it fresh.
+        # changes what Zerodha holds back; the next entry then reads it fresh.
         self._funds_stale = True
         self._funds_gen = 0          # bumped on every change: a read begun before one doesn't count
         self._released_at = 0.0      # when our last exit / cancel freed margin (monotonic)
-        # How long DhanHQ took to give each side's last candle (ms) — shown on the SELL ORDER line.
+        # How long Kite took to give each side's last candle (ms) — shown on the SELL ORDER line.
         self._bar_ms: Dict[str, float] = {}
         self._positions_checked_at = 0.0
-        # Contracts where Dhan's position differs from the engine's (manual
+        # Contracts where Zerodha's position differs from the engine's (manual
         # trades etc.) — re-checked every few seconds, see _check_foreign_positions.
         self._foreign_contracts: set = set()
-        # Contracts where Dhan shows a position this engine didn't open — it
+        # Contracts where Zerodha shows a position this engine didn't open — it
         # won't trade them (see _reconcile_live).
         self._blocked_contracts: set = set()
         # Contract -> monotonic time of the engine's last fill in it (see
@@ -406,7 +406,7 @@ class OptionsEngine:
         self._running = True
         if self.broker is not None:
             logger.info(
-                "OptionsEngine starting | LIVE | max lots/trade=%d | sized on Dhan's available funds | "
+                "OptionsEngine starting | LIVE | max lots/trade=%d | sized on Zerodha's available funds | "
                 "lot size=%d (config default) | exits: HA stop + profit lock + %s square-off",
                 min(self.config.max_lots_per_trade, self.config.live_max_lots), self.config.lot_size,
                 self.config.squareoff_at,
@@ -440,9 +440,9 @@ class OptionsEngine:
         # the boundary. See _candle_clock().
         self._spawn(self._candle_clock())
         if self.broker is not None:
-            # Fills are PUSHED by Dhan (see broker.OrderUpdateStream) — the
+            # Fills are PUSHED by Zerodha (see broker.OrderUpdateStream) — the
             # fast way to know an order filled; REST polling stays as fallback.
-            self.broker.stream = OrderUpdateStream(self.config.client_id, self.config.access_token)
+            self.broker.stream = OrderUpdateStream(self.config.api_key, self.config.access_token)
             self._spawn(self.broker.stream.run())
 
         if had_prior_state:
@@ -469,7 +469,7 @@ class OptionsEngine:
             try:
                 await self._cancel_armed("engine stopping")
             except Exception:
-                logger.exception("Could not cancel the waiting sell order at shutdown — check the Dhan app.")
+                logger.exception("Could not cancel the waiting sell order at shutdown — check the Kite app.")
             if self.broker is not None and self.broker.stream is not None:
                 await self.broker.stream.stop()
             await self._cancel_background_tasks()
@@ -563,7 +563,7 @@ class OptionsEngine:
             return
         closed = [(side, self.legs[side], candle) for side in _LEGS if self.legs[side].security_id
                   for candle in self.legs[side].candle_builder.flush_completed(boundary)]
-        # Both legs' DhanHQ bars are fetched AT THE SAME TIME, then evaluated
+        # Both legs' Kite bars are fetched AT THE SAME TIME, then evaluated
         # in the usual order (CE, then PE) — never one leg waiting on the other's fetch.
         # Candle 3's close also ends a waiting sell: cancelled (or, if it filled
         # meanwhile, booked) while the bars are being fetched.
@@ -635,7 +635,7 @@ class OptionsEngine:
             if not getattr(self, "_auto_stop_held", False):
                 self._auto_stop_held = True
                 logger.critical("Past %s IST but a position is still OPEN — not stopping by itself. "
-                                "Check the Dhan app.", self.config.auto_stop_at)
+                                "Check the Kite app.", self.config.auto_stop_at)
             return False
         logger.info("Market closed for the day (past %s IST) — stopping.", self.config.auto_stop_at)
         self.stop()
@@ -658,7 +658,7 @@ class OptionsEngine:
     # ── Real-time tick entrypoint (called from the WebSocket thread) ──────────
 
     def on_market_tick(self, sec_id: str, price: float, ts: datetime) -> None:
-        """Called on the main event loop for every premium tick DhanHQ pushes."""
+        """Called on the main event loop for every premium tick Kite pushes."""
         self._maybe_roll_day()
 
         mkt = get_market_status()
@@ -759,8 +759,8 @@ class OptionsEngine:
         now_ist = datetime.now(_IST)
         today = now_ist.date()
 
-        # BUG FIXED (1): this asked DhanHQ for candles "from 09:15:00". When a
-        # request starts exactly on 09:15:00, DhanHQ leaves the opening prints
+        # BUG FIXED (1): this asked Kite for candles "from 09:15:00". When a
+        # request starts exactly on 09:15:00, Kite leaves the opening prints
         # out of the 09:15 bar (confirmed on 29-Sep: 22600 CE came back with
         # O=146.70 H=153.45 instead of O=H=199.85; 22500 PE with L=8.65
         # instead of 4.00) — and for a past day it drops the 09:15 bar
@@ -795,7 +795,7 @@ class OptionsEngine:
         interval_secs = self.config.candle_timeframe_secs
         current_bucket_start = (int(datetime.now(timezone.utc).timestamp()) // interval_secs) * interval_secs
         candles = [c for c in candles if (int(c["timestamp"]) // interval_secs) * interval_secs < current_bucket_start]
-        # DhanHQ's intraday endpoint also returns bars outside the session
+        # Kite's intraday endpoint also returns bars outside the session
         # (confirmed: 15:30 and 15:35 option bars, and a 20:00 bar on the
         # index). They'd enter the HA recursion and shift every colour after
         # them, so only regular-session bars are replayed.
@@ -868,8 +868,8 @@ class OptionsEngine:
             # "running" here only looks healthy while doing nothing. State is
             # saved, so a restart with a fresh token resumes any open position.
             logger.critical(
-                "Stopping: DhanHQ rejected the access token. Open positions (if any) are saved "
-                "and will be resumed after a restart with a fresh DHAN_ACCESS_TOKEN."
+                "Stopping: Kite rejected the access token. Open positions (if any) are saved "
+                "and will be resumed after a restart with a fresh KITE_ACCESS_TOKEN (python scripts/kite_login.py)."
             )
             self.stop()
             return
@@ -977,7 +977,7 @@ class OptionsEngine:
         BUG FIXED: _check_exits used to be reachable only from
         on_market_tick(), making every exit — the trailing stop AND the square-off
         square-off — entirely tick-driven. Any quiet feed meant an open SHORT
-        sat with its stop-loss silently not running: an expired token (DhanHQ
+        sat with its stop-loss silently not running: an expired token (Kite
         closes the socket with code 50, which the SDK only print()s), a
         strike illiquid enough to go minutes without a trade, or a TLS
         failure that stops the feed connecting at all. On sold premium that
@@ -1231,7 +1231,7 @@ class OptionsEngine:
 
     async def _ensure_contract_async(self, side: str, leg: LegState) -> None:
         """The first call may trigger a scrip-master CSV download (up to
-        60s) — runs off the event loop (see dhan_client.py) so it never
+        60s) — runs off the event loop (see kite_client.py) so it never
         blocks ticks."""
         if leg.security_id is not None or self.expiry is None or leg.strike is None:
             return
@@ -1336,7 +1336,7 @@ class OptionsEngine:
 
         if leg.position is not None and candle.start_ts >= leg.position.entry_time:
             # The feed sends snapshots, so a brief touch of a profit mark can be
-            # missed between them; the bar's low (DhanHQ's, when available) has it.
+            # missed between them; the bar's low (Kite's, when available) has it.
             self._track_profit(side, leg, float(candle.low))
         if leg.position is not None:
             trailing = self._stop_level(leg.ha_engine.df, candle_index)
@@ -1499,7 +1499,7 @@ class OptionsEngine:
     # ── Funds (live) ─────────────────────────────────────────────────────────
 
     def _funds_changed(self, released: bool = False) -> None:
-        """Our own fill / exit / cancel changed the margin Dhan holds back, so
+        """Our own fill / exit / cancel changed the margin Zerodha holds back, so
         the remembered funds figure is no longer right."""
         self._funds_stale = True
         self._funds_gen += 1
@@ -1507,7 +1507,7 @@ class OptionsEngine:
             self._released_at = time.monotonic()
 
     async def _read_funds(self) -> Optional[float]:
-        """Ask Dhan for the available funds now, and remember them."""
+        """Ask Zerodha for the available funds now, and remember them."""
         gen = self._funds_gen
         funds = await self.broker.funds_async()
         if funds is not None:
@@ -1521,10 +1521,10 @@ class OptionsEngine:
 
         BUG FIXED (08-Oct 11:13, 11:25, 11:55): funds were re-read only every
         60 s. Right after our own trade exited, or our own sell order was
-        cancelled, the engine still used a figure read while Dhan held ~Rs 1.5
+        cancelled, the engine still used a figure read while Zerodha held ~Rs 1.5
         lakh back for it — "funds can't cover 1 lot" with Rs 2 lakh in the
         account, 1-4 ms after the release. Now a stale figure is read again
-        first, and if Dhan hasn't freed the margin yet it is re-read a few times."""
+        first, and if Zerodha hasn't freed the margin yet it is re-read a few times."""
         if self.broker is None:
             return None
         if self._funds_stale or time.monotonic() - self._funds_checked_at > _FUNDS_REFRESH_SECS:
@@ -1607,7 +1607,7 @@ class OptionsEngine:
                     self._armed = a
                     await self._sell_now(a, self._price_now(side, trigger))
                     return
-                logger.error("[%-2s] %s: sell order REFUSED by Dhan (%s) — no trade.", side, window, msg)
+                logger.error("[%-2s] %s: sell order REFUSED by Zerodha (%s) — no trade.", side, window, msg)
                 self.ledger.log_event("ORDER_FAILED", symbol=side, details=f"SELL STOP_LOSS trigger={trigger:.2f} {msg}")
                 return
             a.order_id = order_id
@@ -1616,7 +1616,7 @@ class OptionsEngine:
             sent_ms = (time.monotonic() - t0) * 1000.0
             bar_ms = self._bar_ms.get(side)
             at_close = (datetime.now(timezone.utc) - candle2.end_ts).total_seconds() < 5.0
-            timing = (f" (candle from DhanHQ {bar_ms:.0f} ms + order sent in {sent_ms:.0f} ms)"
+            timing = (f" (candle from Kite {bar_ms:.0f} ms + order sent in {sent_ms:.0f} ms)"
                       if at_close and bar_ms is not None else f" (order sent in {sent_ms:.0f} ms)")
             logger.info("[%-2s] SELL ORDER %5.0f | x%d parked AT THE EXCHANGE: trigger %.2f limit %.2f "
                         "(candle 2 HA Low %.2f − %g) for %s | stop %.2f | order %s%s%s",
@@ -1683,7 +1683,7 @@ class OptionsEngine:
         side, leg = a.side, a.leg
         if leg is not self.legs.get(side) or leg.position is not None:
             logger.critical("[%-2s] a sell filled (%s x%d @ %.2f) but the engine can't attach it to its leg — "
-                            "check the Dhan app.", side, order_id, qty, price)
+                            "check the Kite app.", side, order_id, qty, price)
             return False
         leg.position = OpenPosition(symbol=side, entry_price=price, qty=qty, entry_order_id=order_id,
                                     cover_level=a.stop, entry_time=at_time)
@@ -1735,7 +1735,7 @@ class OptionsEngine:
             self._check_exits(side, leg, price, squareoff_due, at_time=ts)
 
     async def _watch_armed(self, a: ArmedEntry) -> None:
-        """Live: wait for the parked sell to fill — Dhan pushes it (~10 ms);
+        """Live: wait for the parked sell to fill — Zerodha pushes it (~10 ms);
         REST is asked every _ARM_POLL_SECS, and at once when the feed shows the
         price at the sell price."""
         stream = self.broker.stream
@@ -1762,7 +1762,7 @@ class OptionsEngine:
                         if self._armed is a:
                             self._armed = None
                         self._save_state()
-                        logger.warning("[%-2s] the waiting sell order %s is %s at Dhan (%s) — no trade.",
+                        logger.warning("[%-2s] the waiting sell order %s is %s at Zerodha (%s) — no trade.",
                                        a.side, a.order_id, st.status, st.message)
                 return
             waiters = [asyncio.ensure_future(a.kick.wait())]
@@ -1826,7 +1826,7 @@ class OptionsEngine:
                 return
             ok, msg = await self.broker.cancel_async(a.order_id)
             st = await self._settled_status(a.order_id)
-            self._funds_changed(released=True)          # Dhan frees the margin it held for this order
+            self._funds_changed(released=True)          # Zerodha frees the margin it held for this order
             if st.filled_qty > 0:
                 booked = self._book_entry_fill(a, st.avg_price or a.trigger, min(st.filled_qty, a.qty), a.order_id,
                                                datetime.now(timezone.utc), f"LIVE order {a.order_id}")
@@ -1841,7 +1841,7 @@ class OptionsEngine:
                                       details=f"window={a.window} sell={a.trigger:.2f} order={a.order_id} {why}")
             else:
                 logger.critical("[%-2s] waiting sell order %s is still %s after the cancel (%s) — retrying; "
-                                "check the Dhan app.", a.side, a.order_id, st.status, msg)
+                                "check the Kite app.", a.side, a.order_id, st.status, msg)
         if booked:
             await self._protect_new_entry(a)
 
@@ -1900,7 +1900,7 @@ class OptionsEngine:
                                oid, o.get("tradingSymbol", "?"), o.get("triggerPrice"), "" if ok else f" — FAILED: {msg}")
 
     async def _fetch_bar(self, leg: LegState, candle: Candle, max_wait: float) -> Optional[dict]:
-        """DhanHQ's own bar for `candle`'s bucket, asked for until it appears
+        """Kite's own bar for `candle`'s bucket, asked for until it appears
         or `max_wait` seconds pass (None then). Never blocks longer than that,
         even if a request hangs."""
         tf = self.config.candle_timeframe_secs
@@ -1934,16 +1934,16 @@ class OptionsEngine:
                           synthetic=False)
 
     async def _finalize_candle(self, side: str, leg: LegState, candle: Candle) -> Optional[Candle]:
-        """The candle to evaluate: DhanHQ's own bar for it when available, else
+        """The candle to evaluate: Kite's own bar for it when available, else
         the live-feed candle. None = drop it (strikes changed meanwhile).
 
         1. The candle half-formed when this leg started (engine start, restart,
            strike change) was only partly seen — start at 10:02 and 10:00-10:02
-           is missing. It is ALWAYS completed from DhanHQ; if that fails, a
+           is missing. It is ALWAYS completed from Kite; if that fails, a
            signal on it is not traded.
         2. Every other candle (OPTIONS_OFFICIAL_CANDLES=true): the live feed
            sends snapshots, not every trade, so its highs/lows can differ from
-           the exchange's — and the pattern level is an HA low. DhanHQ's bar is
+           the exchange's — and the pattern level is an HA low. Kite's bar is
            what the chart shows; if it hasn't appeared within
            OPTIONS_OFFICIAL_CANDLE_WAIT_MS, the live-feed candle is used."""
         if leg is not self.legs.get(side):
@@ -1975,21 +1975,21 @@ class OptionsEngine:
             if partial:
                 leg.unverified_bucket = candle.start_ts
                 logger.warning(
-                    "[%-2s] %s was only partly seen (engine started mid-candle) and DhanHQ hadn't published the "
+                    "[%-2s] %s was only partly seen (engine started mid-candle) and Kite hadn't published the "
                     "full candle within %.0fs — it still updates the pattern, but a signal on it will NOT be traded.",
                     side, window, max_wait)
             else:
-                logger.warning("[%-2s] %s: DhanHQ's bar not available within %.0f ms — using the live-feed candle.",
+                logger.warning("[%-2s] %s: Kite's bar not available within %.0f ms — using the live-feed candle.",
                                side, window, max_wait * 1000.0)
             return candle
         if partial:
             logger.info(
-                "[%-2s] %s completed from DhanHQ (engine started mid-candle): live feed saw O=%.2f H=%.2f L=%.2f "
+                "[%-2s] %s completed from Kite (engine started mid-candle): live feed saw O=%.2f H=%.2f L=%.2f "
                 "C=%.2f, full candle O=%.2f H=%.2f L=%.2f C=%.2f",
                 side, window, candle.open, candle.high, candle.low, candle.close,
                 bar["open"], bar["high"], bar["low"], bar["close"])
         else:
-            logger.debug("[%-2s] %s DhanHQ bar in %.0f ms: O=%.2f H=%.2f L=%.2f C=%.2f (live feed O=%.2f H=%.2f "
+            logger.debug("[%-2s] %s Kite bar in %.0f ms: O=%.2f H=%.2f L=%.2f C=%.2f (live feed O=%.2f H=%.2f "
                          "L=%.2f C=%.2f)", side, window, took_ms, bar["open"], bar["high"], bar["low"], bar["close"],
                          candle.open, candle.high, candle.low, candle.close)
         used = self._with_bar(candle, bar)
@@ -1997,7 +1997,7 @@ class OptionsEngine:
         return used
 
     async def _recheck_bar(self, side: str, leg: LegState, used: Candle) -> None:
-        """Fetch the bar again a little later: if DhanHQ revised it after the
+        """Fetch the bar again a little later: if Kite revised it after the
         engine acted on it, say so (it was final at first sight in every check
         so far — this keeps proving that on the VM)."""
         await asyncio.sleep(_BAR_RECHECK_SECS)
@@ -2008,7 +2008,7 @@ class OptionsEngine:
                 for k in ("open", "high", "low", "close") if abs(getattr(used, k) - float(bar[k])) > 1e-6]
         if diff:
             window = f"{used.start_ts.astimezone(_IST):%H:%M}-{used.end_ts.astimezone(_IST):%H:%M}"
-            logger.warning("[%-2s] %s: DhanHQ revised this bar after it was used (%s).", side, window, ", ".join(diff))
+            logger.warning("[%-2s] %s: Kite revised this bar after it was used (%s).", side, window, ", ".join(diff))
             self.ledger.log_event("BAR_REVISED", symbol=side, details=f"candle={window} {' '.join(diff)}")
 
     def _entry_skip_reason(
@@ -2025,9 +2025,9 @@ class OptionsEngine:
             return (f"daily loss limit reached (net Rs {self.realized_pnl:.2f}, "
                     f"limit Rs -{self.config.max_daily_loss:.0f})")
         if leg.security_id in self._foreign_contracts:
-            return "Dhan shows a position in this contract that the engine did not open - not trading it"
+            return "Zerodha shows a position in this contract that the engine did not open - not trading it"
         if leg.security_id in self._blocked_contracts:
-            return "Dhan shows a position in this contract that the engine did not open - blocked"
+            return "Zerodha shows a position in this contract that the engine did not open - blocked"
         if leg.position is not None:
             return "already short this leg"
         other_open = [s for s in _LEGS if s != side and self.legs[s].position is not None]
@@ -2173,21 +2173,21 @@ class OptionsEngine:
         return res
 
     async def _verify_entry_price(self, side: str, leg: LegState, order_id: str, pushed_price: float) -> None:
-        """The entry was confirmed from Dhan's push; confirm its average price
+        """The entry was confirmed from Zerodha's push; confirm its average price
         over REST too, and correct the position if they differ."""
         st = await self.broker.status_async(order_id)
         pos = leg.position
         if pos is None or pos.entry_order_id != order_id or st.avg_price <= 0:
             return
         if abs(st.avg_price - pushed_price) > 1e-6:
-            logger.info("[%-2s] entry price corrected from Dhan's order book: %.2f -> %.2f", side, pushed_price, st.avg_price)
+            logger.info("[%-2s] entry price corrected from Zerodha's order book: %.2f -> %.2f", side, pushed_price, st.avg_price)
             pos.entry_price = st.avg_price
             self._save_state()
 
     def _exchange_level(self, side: str, pos: OpenPosition) -> float:
         """Where the BUY order parked at the exchange belongs: the closer of the
         Heikin-Ashi stop and the profit lock. The lock only while the price is
-        below it — Dhan refuses a buy-stop trigger at or below the market; at or
+        below it — Zerodha refuses a buy-stop trigger at or below the market; at or
         above the lock the engine buys back itself (_check_exits_live)."""
         levels = [pos.cover_level] if pos.cover_level > 0 else []
         last = self._last_premium.get(side, 0.0)
@@ -2289,7 +2289,7 @@ class OptionsEngine:
         else:
             st = await self.broker.status_async(pos.stop_order_id)
             if st.status in ("PENDING", "TRANSIT") and st.filled_qty == 0:
-                # Still resting but refused the change — typically Dhan's cap on
+                # Still resting but refused the change — typically Zerodha's cap on
                 # modifications per order, which a long trade (a stop move every
                 # candle) can reach. Replace it with a fresh order at the new level.
                 ok_c, _ = await self.broker.cancel_async(pos.stop_order_id)
@@ -2350,34 +2350,34 @@ class OptionsEngine:
             self._spawn(self._live_close(side, leg, pos.exit_pending))
 
     async def _broker_net(self, security_id: str) -> Optional[Tuple[int, float]]:
-        """(net qty, buy average) Dhan shows for this contract today, or None
-        if Dhan couldn't be read. A short is negative; 0 = flat."""
+        """(net qty, buy average) Zerodha shows for this contract today, or None
+        if Zerodha couldn't be read. A short is negative; 0 = flat."""
         positions = await self.broker.positions_async()
         if positions is None:
             return None
         rows = [p for p in positions if str(p.get("securityId")) == str(security_id)]
-        # Summed: nothing in Dhan's docs promises one row per contract.
+        # Summed: nothing in Zerodha's docs promises one row per contract.
         net = sum(int(float(p.get("netQty", 0) or 0)) for p in rows)
         buy_avg = float(rows[0].get("buyAvg", 0) or 0) if len(rows) == 1 else 0.0
         return net, buy_avg
 
     async def _closed_outside(self, side: str, leg: LegState) -> bool:
-        """True (and the trade is booked) if Dhan shows this leg already flat —
-        i.e. it was bought back outside the engine, by hand in the Dhan app.
+        """True (and the trade is booked) if Zerodha shows this leg already flat —
+        i.e. it was bought back outside the engine, by hand in the Kite app.
 
         BUG FIXED: the engine only ever learned about its OWN orders. After a
         manual exit it still believed it was short, so it (a) re-placed the
         stop when it found it cancelled — a stop that, if triggered, would BUY
         65 into a flat account = an unintended LONG — and (b) at the square-off sent a
         market BUY for the same reason. Now any buy-back or re-placed stop is
-        preceded by asking Dhan whether the short still exists."""
+        preceded by asking Zerodha whether the short still exists."""
         pos = leg.position
         if pos is None or self._recent_fill(leg.security_id):
             return False
         got = await self._broker_net(leg.security_id)
         if got is None or got[0] != 0:
             return False
-        # Flat on one read isn't enough to stop managing a live short — Dhan's
+        # Flat on one read isn't enough to stop managing a live short — Zerodha's
         # positions lag fills. Ask again a moment later.
         await asyncio.sleep(_FLAT_CONFIRM_SECS)
         if leg.position is not pos or self._recent_fill(leg.security_id):
@@ -2399,7 +2399,7 @@ class OptionsEngine:
                 await self.broker.cancel_async(pos.stop_order_id)     # it would open a LONG now
             pos.stop_order_id = ""
         price, source = await self._outside_exit_price(side, leg, pos)
-        logger.warning("[%-2s] position was closed OUTSIDE the engine (Dhan shows it flat) — booking the "
+        logger.warning("[%-2s] position was closed OUTSIDE the engine (Zerodha shows it flat) — booking the "
                        "exit at %.2f (%s); its protective stop is cancelled.", side, price, source)
         self._exit(side, leg, price, "CLOSED_OUTSIDE_ENGINE")
         return True
@@ -2409,7 +2409,7 @@ class OptionsEngine:
         return at is not None and time.monotonic() - at < _POSITION_SETTLE_SECS
 
     async def _outside_exit_price(self, side: str, leg: LegState, pos: OpenPosition) -> Tuple[float, str]:
-        """What the position was actually bought back at, from Dhan's trade
+        """What the position was actually bought back at, from Zerodha's trade
         book: the BUY fills in this contract after the entry. BUG FIXED: this
         used the positions' buy average, which covers the whole DAY — on
         30-Sep it averaged in two earlier stop-outs (122.20, 126.00) and booked
@@ -2432,11 +2432,11 @@ class OptionsEngine:
         buys = [b for b in sorted(buys) if b[1] > 0 and b[2] > 0]
         if buys:
             qty = sum(q for _, q, _ in buys)
-            return round(sum(q * p for _, q, p in buys) / qty, 2), f"Dhan trade book, {len(buys)} buy fill(s)"
-        return self._last_premium.get(side, pos.cover_level), "last traded price — Dhan's trade book had no matching buy"
+            return round(sum(q * p for _, q, p in buys) / qty, 2), f"Zerodha trade book, {len(buys)} buy fill(s)"
+        return self._last_premium.get(side, pos.cover_level), "last traded price — Zerodha's trade book had no matching buy"
 
     async def _check_foreign_positions(self) -> None:
-        """Compare every NSE_FNO position at Dhan with what the engine itself
+        """Compare every NFO position at Zerodha with what the engine itself
         holds. Anything else — a manual trade, or a position the engine lost —
         blocks that contract for new entries and raises a CRITICAL alert once.
         The engine does NOT take over positions it didn't open: that's your
@@ -2457,7 +2457,7 @@ class OptionsEngine:
             names[sec] = str(p.get("tradingSymbol", "?"))
         for sec, net in nets.items():
             if self._recent_fill(sec):
-                # Dhan's positions can lag a fill by seconds (30-Sep 14:15:02
+                # Zerodha's positions can lag a fill by seconds (30-Sep 14:15:02
                 # showed net 0 for the short filled at 14:15:00).
                 if sec in self._foreign_contracts:
                     foreign.add(sec)
@@ -2471,16 +2471,16 @@ class OptionsEngine:
                 if sec not in self._foreign_contracts:
                     ours = mine.get(sec, 0)
                     logger.critical(
-                        "Dhan shows net %d in security %s (%s) but the engine holds %d there — a position the "
+                        "Zerodha shows net %d in security %s (%s) but the engine holds %d there — a position the "
                         "engine didn't open, or one it lost track of. That contract is blocked for new entries; "
-                        "check the Dhan app.", net, sec, names.get(sec, "?"), ours)
-                    self.ledger.log_event("FOREIGN_POSITION", details=f"security={sec} dhan_net={net} engine={ours}")
+                        "check the Kite app.", net, sec, names.get(sec, "?"), ours)
+                    self.ledger.log_event("FOREIGN_POSITION", details=f"security={sec} broker_net={net} engine={ours}")
         self._foreign_contracts = foreign
 
     async def _own_exit_filled(self, sec: str) -> bool:
-        """True when Dhan shows our short gone because OUR OWN exit already
+        """True when Zerodha shows our short gone because OUR OWN exit already
         happened there: the exchange stop filled, or a buy-back is in flight.
-        BUG FIXED (08-Oct 10:56:02): the stop had filled at Dhan a moment
+        BUG FIXED (08-Oct 10:56:02): the stop had filled at Zerodha a moment
         before the engine heard; the position check ran first and raised
         "a position the engine didn't open" — booked normally 1 s later."""
         for leg in self.legs.values():
@@ -2497,7 +2497,7 @@ class OptionsEngine:
     async def _poll_live_stops(self) -> None:
         """Once a second: did an exchange stop fill? Did one vanish? Does a
         crossed stop need escalating even though no new tick has arrived?
-        Every few seconds: is the position still open at Dhan at all?"""
+        Every few seconds: is the position still open at Zerodha at all?"""
         check_positions = time.monotonic() - self._positions_checked_at >= _POSITION_CHECK_SECS
         if check_positions:
             self._positions_checked_at = time.monotonic()
@@ -2536,7 +2536,7 @@ class OptionsEngine:
                     if leg.position is not None and await self._closed_outside(side, leg):
                         continue
                     if leg.position is not None:
-                        logger.critical("[%-2s] exchange stop is %s (%s) but Dhan still shows the short — "
+                        logger.critical("[%-2s] exchange stop is %s (%s) but Zerodha still shows the short — "
                                         "re-placing it.", side, st.status, st.message)
                         await self._place_protective_stop(side, leg)
                     continue
@@ -2585,24 +2585,24 @@ class OptionsEngine:
                     return
                 pos.stop_order_id = ""
             if await self._closed_outside(side, leg):
-                return                     # already flat at Dhan: a BUY now would make it LONG
+                return                     # already flat at Zerodha: a BUY now would make it LONG
             ref = self._last_premium.get(side, pos.cover_level)
             res = await self._live_order("BUY", side, leg, remaining, ref_price=ref)
             if res.filled_qty > 0:
                 self._exit(side, leg, res.avg_price, reason, exit_order_id=res.order_id, qty=res.filled_qty)
             if leg.position is not None:
                 logger.critical("[%-2s] LIVE BUY-BACK INCOMPLETE (%s: %s) — %d still short. Retrying; "
-                                "check the Dhan app.", side, res.status, res.message, leg.position.qty)
+                                "check the Kite app.", side, res.status, res.message, leg.position.qty)
         finally:
             if leg.position is not None:
                 leg.position.closing = False          # allow the next cycle to retry
 
     async def _reconcile_live(self) -> None:
-        """At startup, compare what this engine thinks is open with what Dhan
+        """At startup, compare what this engine thinks is open with what Zerodha
         says is open, before anything is traded."""
         positions = await self.broker.positions_async()
         if positions is None:
-            logger.critical("Could not read positions from Dhan — refusing to trade until it can. "
+            logger.critical("Could not read positions from Zerodha — refusing to trade until it can. "
                             "(Token / Trading API access / network.)")
             self.stop()
             return
@@ -2622,7 +2622,7 @@ class OptionsEngine:
             known.add(leg.security_id)
             net = broker.get(leg.security_id, 0)
             if net == -pos.qty:
-                logger.info("[%-2s] live position confirmed at Dhan: short %d. Resuming.", side, pos.qty)
+                logger.info("[%-2s] live position confirmed at Zerodha: short %d. Resuming.", side, pos.qty)
                 if pos.stop_order_id:
                     st = await self.broker.status_async(pos.stop_order_id)
                     if st.status not in ("PENDING", "TRANSIT", "TRIGGERED", "PART_TRADED"):
@@ -2632,7 +2632,7 @@ class OptionsEngine:
             elif net == 0:
                 st = await self.broker.status_async(pos.stop_order_id) if pos.stop_order_id else None
                 # The real buy-back price: the stop's own fill if it filled,
-                # else the BUY fills after entry in Dhan's trade book — never
+                # else the BUY fills after entry in Zerodha's trade book — never
                 # the positions' buy average, which covers the whole day.
                 if st and st.filled_qty >= pos.qty and st.avg_price > 0:
                     price, source = st.avg_price, "the exchange stop's fill"
@@ -2640,25 +2640,25 @@ class OptionsEngine:
                     price, source = await self._outside_exit_price(side, leg, pos)
                 if st and st.status in ("PENDING", "TRANSIT", "TRIGGERED"):
                     await self.broker.cancel_async(pos.stop_order_id)   # flat now: it could only open a LONG
-                logger.warning("[%-2s] Dhan shows this position already CLOSED (stop filled or closed by hand "
+                logger.warning("[%-2s] Zerodha shows this position already CLOSED (stop filled or closed by hand "
                                "while the engine was down) — booking it at %.2f (%s).", side, price, source)
                 pos.stop_order_id = ""
                 self._exit(side, leg, price, "CLOSED_WHILE_OFFLINE")
             else:
-                logger.critical("[%-2s] Dhan shows net %d but the engine expected short %d — blocking this "
-                                "contract. Fix it in the Dhan app, then restart.", side, net, pos.qty)
+                logger.critical("[%-2s] Zerodha shows net %d but the engine expected short %d — blocking this "
+                                "contract. Fix it in the Kite app, then restart.", side, net, pos.qty)
                 self._blocked_contracts.add(leg.security_id)
         for sec, net in broker.items():
             if net != 0 and sec not in known:
                 self._blocked_contracts.add(sec)
-                logger.critical("Dhan shows an open NSE_FNO position the engine didn't open (security %s, "
+                logger.critical("Zerodha shows an open NFO position the engine didn't open (security %s, "
                                 "net %d). The engine will not trade that contract.", sec, net)
         funds = await self._read_funds()
         if funds is not None:
-            logger.info("Dhan available funds: Rs %.2f", funds)
+            logger.info("Zerodha available funds: Rs %.2f", funds)
             need = self.config.fallback_margin_per_lot
             if funds < need:
-                logger.critical("FUNDS TOO LOW: Rs %.0f in Dhan, about Rs %.0f needed for 1 lot. NO sell order can be "
+                logger.critical("FUNDS TOO LOW: Rs %.0f in Zerodha, about Rs %.0f needed for 1 lot. NO sell order can be "
                                 "placed today until funds are added.", funds, need)
 
     async def _kill_switch(self) -> None:
@@ -2792,7 +2792,7 @@ class OptionsEngine:
         )
 
         if self.broker is not None:
-            self._funds_changed(released=True)          # Dhan frees the margin it held for this short
+            self._funds_changed(released=True)          # Zerodha frees the margin it held for this short
         if partial:
             pos.qty -= closed
             logger.critical("[%-2s] PARTIAL close: %d still open — the engine keeps managing it.", side, pos.qty)

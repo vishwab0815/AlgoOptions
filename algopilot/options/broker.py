@@ -1,26 +1,43 @@
 """
-algopilot/options/broker.py — REAL order placement on DhanHQ (live mode only).
+algopilot/options/broker.py — REAL order placement on Zerodha Kite Connect v3 (live mode only).
 
 The strategy never talks to this module directly: OptionsEngine decides WHAT
 to do exactly as in paper mode (same signals, same stop levels, same timing)
 and calls this only to carry it out. In paper mode it is never constructed.
 
-Endpoints and payloads mirror the installed dhanhq SDK (v2) exactly:
-    POST   /v2/orders                          place
-    PUT    /v2/orders/{orderId}                modify
-    DELETE /v2/orders/{orderId}                cancel
-    GET    /v2/orders/{orderId}                status / fill
-    GET    /v2/orders/external/{correlationId} look-up by our own tag
-    GET    /v2/positions                       broker's view of open positions
-    GET    /v2/fundlimit                       available funds
+    POST   /orders/regular                 place      (form-encoded)
+    PUT    /orders/regular/{order_id}      modify
+    DELETE /orders/regular/{order_id}      cancel
+    GET    /orders/{order_id}              order history (array, newest last)
+    GET    /orders                         today's order book
+    GET    /trades                         today's fills
+    GET    /portfolio/positions            {"net": [...], "day": [...]}  (a short has quantity < 0)
+    GET    /user/margins/equity            "net" = money free for a new F&O order
 
-Rules this module keeps no matter what:
-  - A placement that fails at the NETWORK level is never blindly re-sent — a
-    request can reach Dhan and still time out on the way back, and re-sending
-    would open a second real position. It is looked up by its correlationId
-    first; only a confirmed "not found" counts as not placed.
-  - Every price sent is on NSE's 0.05 tick.
-  - A rejection is returned with Dhan's own reason text, never swallowed.
+Kite specifics this module handles so the engine doesn't have to:
+  - Orders go by exchange + tradingsymbol; the engine identifies a contract by
+    its instrument_token (as text). The instrument registry maps one to the other.
+  - Order types: the engine's STOP_LOSS = Kite "SL" (stop-limit; SL-M is
+    blocked on index options), MARKET / LIMIT as they are. Every MARKET order
+    carries market_protection=-1 (required since 1-Apr-2026); Kite turns it
+    into a limit at a protection price, which can stay OPEN in a fast market —
+    wait_for_fill cancels any remainder after its timeout.
+  - Statuses are mapped onto the engine's vocabulary:
+        COMPLETE -> TRADED | CANCELLED | REJECTED
+        OPEN with a partial fill -> PART_TRADED | OPEN (triggered SL) -> TRIGGERED
+        OPEN (limit) / TRIGGER PENDING -> PENDING | every in-between state -> TRANSIT
+  - A modify / cancel of an order that is finished or mid-change is refused
+    ("being processed. Try later."); callers re-read the order instead of retrying.
+  - At most 25 modifications per order: the engine replaces the stop when a move
+    is refused (see engine._sync_protective_stop_once).
+
+Rules kept no matter what:
+  - A placement that fails at the NETWORK level is never blindly re-sent — it
+    may have reached Kite. It is looked up by its tag first; only a confirmed
+    "not found" counts as not placed.
+  - Every price sent is on the 0.05 tick.
+  - A rejection is returned with Kite's own reason text, never swallowed.
+  - Orders are accepted only from the static IP registered on developers.kite.trade.
 """
 from __future__ import annotations
 
@@ -36,50 +53,86 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from ..utils.network import force_ipv4
+from .instruments import InstrumentRegistry
+from .kite_api import KiteHTTP
 from ..utils.secrets import SecretStr
-
-# Dhan allows orders only from the registered static IPv4 address. A request
-# that leaves over IPv6 (confirmed: this module alone went out as IPv6 and
-# Dhan answered ordersAllowed=False) is refused even from the right machine.
-force_ipv4()
 
 logger = logging.getLogger(__name__)
 
-_BASE = "https://api.dhan.co/v2"
-_ORDER_UPDATE_WSS = "wss://api-order-update.dhan.co"   # dhanhq.co/docs/v2/order-update/
 _TICK = 0.05
 _FINAL = {"TRADED", "REJECTED", "CANCELLED", "EXPIRED"}
+_KITE_TYPE = {"STOP_LOSS": "SL", "STOP_LOSS_MARKET": "SL-M", "MARKET": "MARKET", "LIMIT": "LIMIT"}
+_ENGINE_TYPE = {"SL": "STOP_LOSS", "SL-M": "STOP_LOSS_MARKET", "MARKET": "MARKET", "LIMIT": "LIMIT"}
+_MARKET_PROTECTION = "-1"          # automatic protection (Kite's own percentage table)
 
 
 def to_tick(price: float, up: bool) -> float:
-    """Round onto NSE's 0.05 tick — up for a buy stop's trigger/limit (never
-    below the intended level), down for a sell limit (never above it)."""
+    """Round onto the 0.05 tick — up for a buy stop's trigger/limit (never below
+    the intended level), down for a sell limit (never above it)."""
     n = price / _TICK
     n = math.ceil(n - 1e-9) if up else math.floor(n + 1e-9)
     return round(n * _TICK, 2)
 
 
 def new_tag() -> str:
-    """correlationId: our own id on every order, so a placement whose response
-    was lost can still be found instead of being re-sent."""
+    """Our own id on every order (alphanumeric, Kite allows up to 20), so a placement
+    whose response was lost can still be found instead of being re-sent."""
     return "AP" + uuid.uuid4().hex[:16]
 
 
+def engine_status(order: dict) -> str:
+    """Kite order status -> the engine's status words."""
+    st = str(order.get("status") or "").upper()
+    qty = int(float(order.get("quantity") or 0))
+    filled = int(float(order.get("filled_quantity") or 0))
+    if st == "COMPLETE":
+        return "TRADED"
+    if st in ("REJECTED", "CANCELLED"):
+        return st
+    if st == "OPEN":
+        if 0 < filled < qty:
+            return "PART_TRADED"
+        return "TRIGGERED" if str(order.get("order_type") or "").upper() in ("SL", "SL-M") else "PENDING"
+    if st == "TRIGGER PENDING":
+        return "PENDING"
+    return "TRANSIT"                 # PUT ORDER REQ RECEIVED, VALIDATION PENDING, OPEN PENDING, MODIFY ..., CANCEL PENDING, UPDATE
+
+
+def _tag_of(order: dict) -> str:
+    tag = order.get("tag") or ""
+    if tag:
+        return str(tag)
+    for t in order.get("tags") or []:
+        if str(t).startswith("AP"):
+            return str(t)
+    return ""
+
+
+def normalize_order(o: dict) -> dict:
+    """A Kite order in the shape the engine reads (it was written against Dhan's field names)."""
+    return {
+        "orderId": str(o.get("order_id") or ""), "orderStatus": engine_status(o),
+        "transactionType": str(o.get("transaction_type") or "").upper(),
+        "orderType": _ENGINE_TYPE.get(str(o.get("order_type") or "").upper(), str(o.get("order_type") or "")),
+        "correlationId": _tag_of(o), "tradingSymbol": o.get("tradingsymbol"),
+        "securityId": str(o.get("instrument_token") or ""), "triggerPrice": o.get("trigger_price"),
+        "price": o.get("price"), "quantity": o.get("quantity"), "filledQty": o.get("filled_quantity"),
+        "averageTradedPrice": o.get("average_price"), "kiteStatus": o.get("status"),
+        "statusMessage": o.get("status_message") or o.get("status_message_raw") or "",
+    }
+
+
 class OrderUpdateStream:
-    """Dhan's Live Order Update WebSocket: Dhan PUSHES every change to your
-    orders (TRANSIT -> PENDING -> TRADED, fill price, qty) the moment it
-    happens. Waiting on this instead of asking "is it filled yet?" over REST
-    every 250 ms is what makes fill confirmation fast.
+    """Kite pushes every change to your orders over the WebSocket as a text message
+    {"type": "order", "data": {...order...}} — for all of the account's orders. Waiting
+    on this instead of asking "is it filled yet?" over REST is what makes fill
+    confirmation fast. A connection of its own (Kite allows 3 per api_key), no
+    instruments subscribed; it reconnects by itself and logs nothing secret.
+    Updates are snapshots that can repeat or arrive out of order, so a status never
+    goes back from final, and REST stays the source of truth."""
 
-    Written here rather than using dhanhq.orderupdate.OrderUpdate, which
-    print()s the login message INCLUDING YOUR ACCESS TOKEN to the console and
-    never reconnects. This one logs nothing secret and reconnects on its own.
-    Fields are read case-insensitively (the docs write OrderNo/Status, the SDK
-    reads orderNo/status)."""
-
-    def __init__(self, client_id: str, access_token: SecretStr) -> None:
-        self._client_id = str(client_id)
+    def __init__(self, api_key: str, access_token: SecretStr) -> None:
+        self._api_key = api_key
         self._token = access_token
         self._updates: Dict[str, dict] = {}
         self._events: Dict[str, asyncio.Event] = {}
@@ -89,32 +142,29 @@ class OrderUpdateStream:
 
     async def run(self) -> None:
         import websockets
+        url = f"wss://ws.kite.trade?api_key={self._api_key}&access_token={self._token.get_secret()}"
         delay = 1.0
         while not self._stop:
             try:
-                # close_timeout: at shutdown, don't wait the default 10 s for
-                # Dhan to answer the close handshake (30-Sep: Ctrl+C hung 10 s).
-                async with websockets.connect(_ORDER_UPDATE_WSS, ping_interval=20, ping_timeout=20,
-                                              open_timeout=10, close_timeout=2) as ws:
+                async with websockets.connect(url, additional_headers={"X-Kite-Version": "3"}, open_timeout=10,
+                                              close_timeout=2, ping_interval=None) as ws:
                     self._ws = ws
-                    await ws.send(json.dumps({"LoginReq": {"MsgCode": 42, "ClientId": self._client_id,
-                                                           "Token": self._token.get_secret()},
-                                              "UserType": "SELF"}))
                     self.connected, delay = True, 1.0
-                    logger.info("Order-update stream connected (fills are pushed by Dhan).")
+                    logger.info("Order-update stream connected (fills are pushed by Kite).")
                     async for raw in ws:
-                        self._on_message(raw)
+                        if not isinstance(raw, (bytes, bytearray)):
+                            self._on_message(raw)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if not self._stop:
-                    logger.warning("Order-update stream dropped (%s) — reconnecting in %.0fs; "
-                                   "fills are still confirmed over REST meanwhile.", type(exc).__name__, delay)
+                    logger.warning("Order-update stream dropped (%s) — reconnecting in %.0fs; fills are still "
+                                   "confirmed over REST meanwhile.", type(exc).__name__, delay)
             finally:
                 self.connected, self._ws = False, None
             if not self._stop:
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 10.0)
+                delay = min(delay * 2, 30.0)
 
     async def stop(self) -> None:
         self._stop = True
@@ -130,12 +180,17 @@ class OrderUpdateStream:
             msg = json.loads(raw)
         except (ValueError, TypeError):
             return
-        if str(msg.get("Type", "")).lower() != "order_alert":
+        if msg.get("type") != "order" or not isinstance(msg.get("data"), dict):
             return
-        data = {str(k).lower(): v for k, v in (msg.get("Data") or {}).items()}
-        oid = str(data.get("orderno") or "")
+        self.ingest(msg["data"])
+
+    def ingest(self, data: dict) -> None:
+        oid = str(data.get("order_id") or "")
         if not oid:
             return
+        prev = self._updates.get(oid)
+        if prev is not None and engine_status(prev) in _FINAL and engine_status(data) not in _FINAL:
+            return                                   # a late / repeated update: never go back from final
         self._updates[oid] = data
         ev = self._events.get(oid)
         if ev is not None:
@@ -154,20 +209,13 @@ class OrderUpdateStream:
 
     @staticmethod
     def to_result(order_id: str, data: dict) -> "OrderResult":
-        status = str(data.get("status", "")).upper()
-        qty = int(float(data.get("quantity", 0) or 0))
-        traded = int(float(data.get("tradedqty", 0) or 0))
-        # TRADED means the whole order filled.
-        filled = qty if status == "TRADED" and qty else traded
-        avg = float(data.get("avgtradedprice", 0) or 0) or float(data.get("tradedprice", 0) or 0)
-        return OrderResult(order_id, status, filled, avg,
-                           str(data.get("reasondescription") or data.get("remarks") or ""))
+        return KiteBroker.parse(data, order_id)
 
 
 @dataclass
 class OrderResult:
     order_id: Optional[str]
-    status: str                 # TRADED | PART_TRADED | PENDING | REJECTED | CANCELLED | EXPIRED | TIMEOUT | ERROR
+    status: str                 # TRADED | PART_TRADED | PENDING | TRIGGERED | TRANSIT | REJECTED | CANCELLED | TIMEOUT | ERROR
     filled_qty: int = 0
     avg_price: float = 0.0
     message: str = ""
@@ -177,177 +225,174 @@ class OrderResult:
         return self.filled_qty > 0
 
 
-class DhanBroker:
-    def __init__(self, client_id: str, access_token: SecretStr,
-                 exchange_segment: str = "NSE_FNO", product_type: str = "INTRADAY") -> None:
-        self.client_id = client_id
-        self.segment = exchange_segment
-        self.product = product_type
-        self._token = access_token
+class KiteBroker:
+    def __init__(self, api_key: str, access_token: SecretStr, registry: InstrumentRegistry,
+                 exchange: str = "NFO", product: str = "MIS") -> None:
+        self.http = KiteHTTP(api_key, access_token, timeout=5.0)
+        self.registry = registry
+        self.exchange = exchange
+        self.product = product
         self.stream: Optional[OrderUpdateStream] = None   # set by the engine in live mode
-        self.last_call_at = 0.0                           # monotonic time of the last HTTP call
-        self._s = requests.Session()
-        self._s.headers.update({
-            "access-token": access_token.get_secret(), "client-id": client_id,
-            "Content-Type": "application/json", "Accept": "application/json",
-        })
+
+    @property
+    def last_call_at(self) -> float:
+        return self.http.last_call_at
 
     def close(self) -> None:
-        try:
-            self._s.close()
-        except Exception:
-            pass
+        self.http.close()
 
-    # ── HTTP ─────────────────────────────────────────────────────────────────
-
-    def _call(self, method: str, path: str, payload: Optional[dict] = None,
-              timeout: float = 5.0) -> Tuple[int, Any]:
-        """(status_code, parsed body). Raises requests.RequestException on a
-        network failure — callers decide what that means (see place())."""
-        if payload is not None:
-            payload = dict(payload, dhanClientId=self.client_id)
-        self.last_call_at = time.monotonic()
-        resp = self._s.request(method, _BASE + path, json=payload, timeout=timeout)
-        try:
-            body = resp.json() if resp.content else {}
-        except ValueError:
-            body = {"raw": resp.text[:300]}
-        return resp.status_code, body
-
+    # ── helpers ─────────────────────────────────────────────────────────────
     @staticmethod
-    def _reason(code: int, body: Any) -> str:
-        if isinstance(body, dict):
-            ec = body.get("errorCode") or ""
-            msg = body.get("errorMessage") or body.get("omsErrorDescription") or body.get("raw") or ""
-            if code in (401, 403) or ec in ("DH-901", "DH-902"):
-                return (f"HTTP {code} {ec}: {msg} — token expired/invalid, or this account has no "
-                        "Trading API access. Nothing will be placed until it is fixed.")
-            # DH-905 is Dhan's generic "bad input" code. Only the text says
-            # whether it's the IP ("DH-905: Invalid IP") or a request field
-            # (e.g. "Missing required fields, bad values for parameters etc.").
-            if re.search(r"\bIP\b", str(msg), re.IGNORECASE):
-                return (f"{ec}: {msg} — this machine's public IP is not whitelisted for Dhan's order "
-                        "APIs. Register it: web.dhan.co -> DhanHQ Trading APIs -> Static IP.")
-            return f"HTTP {code} {ec}: {msg}".strip()
-        return f"HTTP {code}: {body}"
+    def _reason(reply) -> str:
+        msg = reply.message or ""
+        if re.search(r"not allowed to place orders|No IPs are configured", msg, re.IGNORECASE):
+            return (f"{reply.reason()} — this machine's public IP is not registered for Kite orders. Register it: "
+                    "developers.kite.trade -> Profile -> IP Whitelist (IPv4, the address orders leave from).")
+        if reply.status == 403 or reply.error_type == "TokenException":
+            return f"{reply.reason()} — the access token has expired (06:00 daily) or was replaced by a new login."
+        return reply.reason()
 
-    # ── Orders ───────────────────────────────────────────────────────────────
+    def _symbol(self, security_id: str) -> Optional[str]:
+        ins = self.registry.token(security_id)
+        if ins is None:
+            self.registry.ensure()
+            ins = self.registry.token(security_id)
+        return ins.tradingsymbol if ins is not None else None
 
+    # ── orders ──────────────────────────────────────────────────────────────
     def place(self, side: str, security_id: str, qty: int, order_type: str,
               price: float = 0.0, trigger: float = 0.0, tag: Optional[str] = None) -> Tuple[Optional[str], str]:
         """(order_id, message). order_id None = definitely not placed."""
         tag = tag or new_tag()
-        payload = {
-            "correlationId": tag, "transactionType": side, "exchangeSegment": self.segment,
-            "productType": self.product, "orderType": order_type, "validity": "DAY",
-            "securityId": str(security_id), "quantity": int(qty), "disclosedQuantity": 0,
-            "price": float(price), "triggerPrice": float(trigger), "afterMarketOrder": False,
-        }
+        symbol = self._symbol(security_id)
+        if symbol is None:
+            return None, f"unknown contract {security_id} (not in today's Kite instrument list)"
+        ktype = _KITE_TYPE.get(order_type, order_type)
+        data: Dict[str, Any] = {"tradingsymbol": symbol, "exchange": self.exchange, "transaction_type": side,
+                                "order_type": ktype, "quantity": int(qty), "product": self.product,
+                                "validity": "DAY", "tag": tag}
+        if ktype in ("LIMIT", "SL"):
+            data["price"] = f"{float(price):.2f}"
+        if ktype in ("SL", "SL-M"):
+            data["trigger_price"] = f"{float(trigger):.2f}"
+        if ktype in ("MARKET", "SL-M"):
+            data["market_protection"] = _MARKET_PROTECTION
         try:
-            code, body = self._call("POST", "/orders", payload)
+            reply = self.http.call("POST", "/orders/regular", family="order", data=data)
         except requests.RequestException as exc:
-            # The request may have landed. Find it by our tag; never re-send.
-            logger.warning("Order %s %s x%d: network error (%s) — checking whether Dhan received it.",
-                           side, security_id, qty, exc)
+            logger.warning("Order %s %s x%d: network error (%s) — checking whether Kite received it.",
+                           side, symbol, qty, exc)
             found = self.get_order_by_tag(tag)
-            if found and found.get("orderId"):
-                return str(found["orderId"]), "placed (confirmed by correlationId after a network error)"
-            return None, f"network error and no order found for correlationId {tag}: {exc}"
-        if code in (200, 201) and isinstance(body, dict) and body.get("orderId"):
-            return str(body["orderId"]), str(body.get("orderStatus", ""))
-        return None, self._reason(code, body)
+            if found and found.get("order_id"):
+                return str(found["order_id"]), "placed (confirmed by tag after a network error)"
+            return None, f"network error and no order found with tag {tag}: {exc}"
+        if reply.ok and isinstance(reply.data, dict) and reply.data.get("order_id"):
+            return str(reply.data["order_id"]), "placed"
+        return None, self._reason(reply)
 
     def modify(self, order_id: str, order_type: str, qty: int, price: float, trigger: float) -> Tuple[bool, str]:
-        # No "legName": Dhan accepts it only for Bracket/Cover orders, and only
-        # as ENTRY_LEG / TARGET_LEG / STOP_LOSS_LEG. The empty string sent
-        # before was rejected on every stop move (30-Sep: "DH-905: Missing
-        # required fields, bad values for parameters"), forcing a cancel +
-        # re-place each candle.
-        payload = {"orderId": str(order_id), "orderType": order_type,
-                   "quantity": int(qty), "price": float(price), "disclosedQuantity": 0,
-                   "triggerPrice": float(trigger), "validity": "DAY"}
+        ktype = _KITE_TYPE.get(order_type, order_type)
+        data: Dict[str, Any] = {"order_type": ktype, "quantity": int(qty), "validity": "DAY"}
+        if ktype in ("LIMIT", "SL"):
+            data["price"] = f"{float(price):.2f}"
+        if ktype in ("SL", "SL-M"):
+            data["trigger_price"] = f"{float(trigger):.2f}"
+        if ktype in ("MARKET", "SL-M"):
+            data["market_protection"] = _MARKET_PROTECTION
         try:
-            code, body = self._call("PUT", f"/orders/{order_id}", payload)
+            reply = self.http.call("PUT", f"/orders/regular/{order_id}", family="order", data=data)
         except requests.RequestException as exc:
             return False, f"network error: {exc}"
-        return (code in (200, 201, 202)), ("" if code in (200, 201, 202) else self._reason(code, body))
+        return reply.ok, ("" if reply.ok else self._reason(reply))
 
     def cancel(self, order_id: str) -> Tuple[bool, str]:
         try:
-            code, body = self._call("DELETE", f"/orders/{order_id}")
+            reply = self.http.call("DELETE", f"/orders/regular/{order_id}", family="order")
         except requests.RequestException as exc:
             return False, f"network error: {exc}"
-        return (code in (200, 201, 202)), ("" if code in (200, 201, 202) else self._reason(code, body))
+        return reply.ok, ("" if reply.ok else self._reason(reply))
 
     def get_order(self, order_id: str) -> Optional[dict]:
+        """The order's current state (the last entry of its history), raw Kite fields."""
         try:
-            code, body = self._call("GET", f"/orders/{order_id}")
+            reply = self.http.call("GET", f"/orders/{order_id}")
         except requests.RequestException:
             return None
-        if code != 200:
+        if not reply.ok or not isinstance(reply.data, list) or not reply.data:
             return None
-        return body[0] if isinstance(body, list) and body else (body if isinstance(body, dict) else None)
+        return reply.data[-1]
 
     def get_order_by_tag(self, tag: str) -> Optional[dict]:
         try:
-            code, body = self._call("GET", f"/orders/external/{tag}")
+            reply = self.http.call("GET", "/orders")
         except requests.RequestException:
             return None
-        if code != 200:
+        if not reply.ok or not isinstance(reply.data, list):
             return None
-        return body[0] if isinstance(body, list) and body else (body if isinstance(body, dict) else None)
+        hits = [o for o in reply.data if o.get("tag") == tag or tag in (o.get("tags") or [])]
+        return hits[-1] if hits else None
 
     def orders(self) -> Optional[List[dict]]:
-        """Today's order book."""
+        """Today's order book, in the engine's field names."""
         try:
-            code, body = self._call("GET", "/orders")
+            reply = self.http.call("GET", "/orders")
         except requests.RequestException:
             return None
-        return body if code == 200 and isinstance(body, list) else None
+        if not reply.ok or not isinstance(reply.data, list):
+            return None
+        return [normalize_order(o) for o in reply.data if o.get("exchange") == self.exchange]
 
     def trades(self) -> Optional[List[dict]]:
-        """Today's trade book: every fill, with its own price and time."""
+        """Today's fills: securityId, transactionType, tradedQuantity, tradedPrice, exchangeTime (IST text)."""
         try:
-            code, body = self._call("GET", "/trades")
+            reply = self.http.call("GET", "/trades")
         except requests.RequestException:
             return None
-        return body if code == 200 and isinstance(body, list) else None
+        if not reply.ok or not isinstance(reply.data, list):
+            return None
+        return [{"securityId": str(t.get("instrument_token") or ""), "orderId": str(t.get("order_id") or ""),
+                 "transactionType": str(t.get("transaction_type") or "").upper(),
+                 "tradedQuantity": t.get("quantity"), "tradedPrice": t.get("average_price"),
+                 "exchangeTime": t.get("fill_timestamp") or t.get("exchange_timestamp"),
+                 "tradingSymbol": t.get("tradingsymbol")}
+                for t in reply.data if t.get("exchange") == self.exchange]
 
     def positions(self) -> Optional[List[dict]]:
+        """Open positions (Kite's "net" list): securityId, exchangeSegment, netQty (short < 0), buyAvg, tradingSymbol."""
         try:
-            code, body = self._call("GET", "/positions")
+            reply = self.http.call("GET", "/portfolio/positions")
         except requests.RequestException:
             return None
-        return body if code == 200 and isinstance(body, list) else None
+        if not reply.ok or not isinstance(reply.data, dict):
+            return None
+        return [{"securityId": str(p.get("instrument_token") or ""), "exchangeSegment": str(p.get("exchange") or ""),
+                 "netQty": p.get("quantity"), "buyAvg": p.get("buy_price"), "sellAvg": p.get("sell_price"),
+                 "tradingSymbol": p.get("tradingsymbol"), "productType": p.get("product")}
+                for p in reply.data.get("net") or []]
 
     def available_funds(self) -> Optional[float]:
         try:
-            code, body = self._call("GET", "/fundlimit")
+            reply = self.http.call("GET", "/user/margins/equity")
         except requests.RequestException:
             return None
-        if code != 200 or not isinstance(body, dict):
+        if not reply.ok or not isinstance(reply.data, dict):
             return None
-        # Dhan's own field name is misspelt "availabelBalance".
-        for key in ("availabelBalance", "availableBalance"):
-            if key in body:
-                try:
-                    return float(body[key])
-                except (TypeError, ValueError):
-                    return None
-        return None
+        seg = reply.data.get("equity", reply.data)
+        try:
+            return float(seg.get("net"))
+        except (TypeError, ValueError, AttributeError):
+            return None
 
     @staticmethod
     def parse(order: Optional[dict], order_id: Optional[str]) -> OrderResult:
         if not order:
             return OrderResult(order_id, "ERROR", message="order status unavailable")
-        status = str(order.get("orderStatus", "")).upper()
-        filled = int(float(order.get("filledQty", 0) or 0))
-        avg = float(order.get("averageTradedPrice", 0) or 0)
-        msg = str(order.get("omsErrorDescription") or "")
-        return OrderResult(order_id, status, filled, avg, msg)
+        filled = int(float(order.get("filled_quantity") or 0))
+        avg = float(order.get("average_price") or 0)
+        msg = str(order.get("status_message") or order.get("status_message_raw") or "")
+        return OrderResult(order_id, engine_status(order), filled, avg, msg)
 
-    # ── async wrappers (never block the event loop) ──────────────────────────
-
+    # ── async wrappers (never block the event loop) ─────────────────────────
     async def place_async(self, *a, **k):
         return await asyncio.to_thread(self.place, *a, **k)
 
@@ -372,19 +417,17 @@ class DhanBroker:
     async def funds_async(self):
         return await asyncio.to_thread(self.available_funds)
 
-
     async def wait_for_fill(self, order_id: str, timeout: float = 6.0, exact: bool = False) -> OrderResult:
         """Wait until the order is final, then return its fill.
 
-        SPEED: the pushed order-update (if the stream is connected) answers the
-        moment Dhan knows; REST is asked every 100 ms as well, in case a push
-        is missed. Before, REST was the only source, asked every 250 ms — so a
-        first check that caught the order in TRANSIT cost another 250 ms.
-        exact=True re-reads the final fill over REST before returning (used for
-        exits, whose price is booked straight into the trade record).
+        The pushed order update (if the stream is connected) answers the moment Kite
+        knows; REST is asked every 100 ms as well, in case a push is missed.
+        exact=True re-reads the final fill over REST before returning (used for exits,
+        whose price is booked straight into the trade record).
 
-        On timeout the remainder is cancelled and whatever filled is returned —
-        a market order still working after several seconds must not be left live."""
+        On timeout the remainder is cancelled and whatever filled is returned — a
+        market order (a protected limit at Kite) still working after several seconds
+        must not be left live."""
         deadline = time.monotonic() + timeout
         live = bool(self.stream and self.stream.connected)
         next_poll = time.monotonic() + (0.1 if live else 0.0)
@@ -392,8 +435,8 @@ class DhanBroker:
         try:
             while time.monotonic() < deadline:
                 pushed = self.stream.latest(order_id) if self.stream else None
-                if pushed and str(pushed.get("status", "")).upper() in _FINAL:
-                    res = OrderUpdateStream.to_result(order_id, pushed)
+                if pushed and engine_status(pushed) in _FINAL:
+                    res = self.parse(pushed, order_id)
                     if exact or res.avg_price <= 0:
                         rest = await self.status_async(order_id)
                         if rest.status in _FINAL:
@@ -408,8 +451,6 @@ class DhanBroker:
                         return res
                     next_poll = time.monotonic() + 0.1
                     continue
-                # Race: a push, the in-flight REST check, or the next poll time —
-                # whichever comes first. A push is never kept waiting behind REST.
                 wait = max(0.0, min(next_poll if poll_task is None else deadline, deadline) - time.monotonic())
                 waiters = []
                 if self.stream and self.stream.connected:

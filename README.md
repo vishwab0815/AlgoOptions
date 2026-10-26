@@ -1,6 +1,6 @@
 # AlgoPilotX Options
 
-A NIFTY options premium-selling engine on DhanHQ. Pure backend, no UI: one
+A NIFTY options premium-selling engine on Zerodha (Kite Connect v3). Pure backend, no UI: one
 asyncio process that reads live market data, runs a Heikin-Ashi pattern on
 each option's own premium, and either **paper-trades** or places **real
 orders**, recording everything in a local SQLite ledger.
@@ -8,7 +8,7 @@ orders**, recording everything in a local SQLite ledger.
 | `.env` | What happens |
 |---|---|
 | `OPTIONS_PAPER_TRADING=true` (default) | Paper: live data, simulated fills, **no order is ever sent** |
-| `OPTIONS_PAPER_TRADING=false` | **Live: real orders, real money** on your Dhan account |
+| `OPTIONS_PAPER_TRADING=false` | **Live: real orders, real money** on your Zerodha account |
 
 ## Strategy
 
@@ -74,46 +74,58 @@ orders**, recording everything in a local SQLite ledger.
   If the lock isn't parked yet when price comes back, the engine buys back itself.
 - Hard cap of 1 lot (`OPTIONS_LIVE_MAX_LOTS`), daily loss limit
   (`OPTIONS_MAX_DAILY_LOSS`, default ₹3,000).
-- On restart it checks Dhan's real positions before trading.
+- On restart it checks Zerodha's real positions before trading.
 - **Kill switch:** create an empty file `data/KILL` → it squares off
   everything and stops.
-- Dhan only accepts orders from the account's registered static IPv4 — run
-  live on that machine.
+- Kite accepts orders only from the static IP registered on
+  developers.kite.trade → Profile → IP Whitelist (IPv4, the address orders
+  leave from) — run live on that machine. Reads work from anywhere.
+- Kite specifics handled in `broker.py`: the stop is an `SL` (stop-limit;
+  SL-M is blocked on index options), every MARKET order carries
+  `market_protection=-1` (required since Apr-2026), and a stop moved more
+  than 25 times (Kite's cap) is cancelled and re-placed.
 
 ## Running it
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env      # DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN (same account)
+cp .env.example .env              # KITE_API_KEY (developers.kite.trade -> your app)
+cp secrets.env.example secrets.env  # KITE_API_SECRET (VM only, never in git)
+python scripts/kite_login.py      # every morning: log in on Zerodha's page
 python run_options.py
 ```
 
-The access token lasts 24 h. The engine refuses to start with an expired
-token, or one issued for a different client id, and on a weekend or NSE
-holiday (`algopilot/utils/market_calendar.py`). It stops by itself at 15:31
-once flat (`OPTIONS_AUTO_STOP_AT`), or cleanly at any time when `data/STOP`
-exists.
+You need a Kite Connect app on the paid **Connect** plan (live + historical
+data), with its redirect URL set to `http://127.0.0.1:5000/` so
+`kite_login.py` can catch the login by itself (or paste the redirect URL to it).
+
+Zerodha requires a person to **log in every trading day**; the token then works
+until **06:00 IST the next morning**. There is no unattended token (no API takes
+a password or TOTP). The engine asks Kite whether the token works and refuses to
+start if it doesn't, and doesn't start on a weekend or NSE holiday
+(`algopilot/utils/market_calendar.py`). It stops by itself at 15:31 once flat
+(`OPTIONS_AUTO_STOP_AT`), or cleanly at any time when `data/STOP` exists.
 
 ## Running unattended (VM)
 
 Once, on the VM:
 
-1. Dhan → My Profile → Access DhanHQ APIs → **Set-up TOTP** (keep the text key).
-2. Copy `secrets.env.example` to `secrets.env` and fill in `DHAN_PIN` and
-   `DHAN_TOTP_SECRET`. It stays on the VM: git-ignored, never logged.
-3. `python scripts/auto_token.py --check` — checks the setup (no Dhan call);
-   the code it shows must match your authenticator app.
+1. developers.kite.trade → your app: redirect URL `http://127.0.0.1:5000/`;
+   Profile → **IP Whitelist**: the VM's public IPv4 (135.13.32.41).
+2. Copy `secrets.env.example` to `secrets.env` and fill in `KITE_API_SECRET`.
+   It stays on the VM: git-ignored, never logged.
+3. `python scripts/latency_check.py` — checks the token and the connection.
 4. `python scripts/daily_pipeline.py` — **start it once and leave it running.**
 5. Optional: `python scripts/daily_pipeline.py --install` — it also starts by
    itself whenever you sign in to Windows (e.g. after a reboot).
 
+Every morning (after 06:00): `python scripts/kite_login.py` on the VM.
+
 While it runs:
 
-- **every night at 21:00 IST** a new access token (PIN + TOTP) is made,
-  checked with Dhan and written to `.env` (Dhan has no revoke call — the old
-  token is replaced and expires by itself; a token lasts 24 h, so tonight's
-  covers tomorrow). If the VM was off at 21:00, one is made before the session.
-- **every trading day from 08:45 IST** the engine is started; at 09:17–09:25
+- **every trading day from 08:45 IST** it waits for that morning's Kite login
+  (a loud log line, then a quiet check every minute) and starts the engine the
+  moment the token works; at 09:17–09:25
   it checks NIFTY actually traded (else stops the engine); a crash before the
   close is restarted (max 5, never with `data/KILL`); the engine stops itself
   after the close.
@@ -138,8 +150,11 @@ Everything is in `data/options_ledger.db`:
 
 ```bash
 python scripts/export_candle_log.py [YYYY-MM-DD]     # tables + CSVs in data/exports/
-python scripts/backtest.py 2026-09-22 2026-09-25     # replay real days through the engine
+python scripts/replay_day.py 2026-10-23              # replay a real day through the engine (paper)
 ```
+
+Kite serves candles only for contracts still listed, so `replay_day.py` can
+replay days of the current / next weekly expiry, not expired weeks.
 
 Both are safe to run while the engine is live (read-only / separate ledger).
 
@@ -149,12 +164,17 @@ Both are safe to run while the engine is live (read-only / separate ledger).
 algopilot/
   core/       candle building, Heikin-Ashi
   strategy/   SHORT rules + the GREEN->RED->RED pattern
-  utils/      market hours, IPv4/TLS setup, rate limiter, secrets
-  options/    config, market data (dhan_client), orders (broker), charges,
-              ledger, position/stop maths, engine
+  utils/      market hours, IPv4/TLS setup, secrets
+  options/    config, Kite HTTP (kite_api), instrument list (instruments),
+              market data (kite_client), orders + order updates (broker),
+              price feed (websocket), login (kite_auth), charges, ledger,
+              position/stop maths, engine
 run_options.py              entry point
-scripts/backtest.py         real-data backtest through the engine's own code
+scripts/kite_login.py       the daily Kite login -> KITE_ACCESS_TOKEN in .env
+scripts/replay_day.py       replay a real day through the engine (paper)
 scripts/export_candle_log.py
-scripts/auto_token.py       today's access token from PIN + TOTP (no browser)
-scripts/daily_pipeline.py   one trading day, unattended (--install creates the Windows task)
+scripts/latency_check.py    connection speed to Kite (read-only)
+scripts/daily_pipeline.py   every trading day, unattended (waits for the morning login)
+tests/test_kite.py          offline tests of the Kite layer + the engine on a fake Kite
+tests/test_strategy.py      offline tests of the trading rules
 ```

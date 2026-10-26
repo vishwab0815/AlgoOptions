@@ -1,7 +1,7 @@
 """
 utils/network.py — Force all outbound HTTP(S) traffic in this process onto IPv4.
 
-Root cause this exists to fix: on this machine, DhanHQ order placements were
+Root cause this exists to fix: on this machine, broker order placements were
 intermittently rejected with "DH-905: Invalid IP" even though the whitelisted
 IPv6 address matched a `get_ip()` check taken moments before or after the
 failed order. Confirmed via a direct SDK call surfacing the specific reason
@@ -24,10 +24,9 @@ before anything else runs):
 
 BUG FIXED (architecture review): this used to patch ONLY
 `urllib3.util.connection.allowed_gai_family` — which fixes `requests`-based
-HTTP calls (OrderExecutor's session, the DhanHQ SDK's REST calls), but does
+HTTP calls (the broker's and market-data REST sessions), but does
 NOTHING for either of this project's two WebSocket connections
-(feed/dhan_stream.py's market feed, feed/order_update_stream.py's order
-updates). The `websockets` library resolves hostnames through asyncio's own
+(the market feed and the order-update stream). The `websockets` library resolves hostnames through asyncio's own
 default resolver, which never goes through urllib3 at all — so the exact
 same IPv6 privacy-extension rotation this function exists to fix could still
 silently affect the two connections that have shown the most instability in
@@ -66,7 +65,7 @@ def ensure_tls_trust_store() -> None:
     and never reconnected — so the engine ran a full session on REST polling
     alone, receiving zero ticks and opening zero trades, while looking
     healthy in the log. A Python install that has no usable system trust
-    store cannot verify api.dhan.co, and `ssl.create_default_context()`
+    store cannot verify api.kite.trade, and `ssl.create_default_context()`
     (which `websockets` and `requests` both use) silently has nothing to
     verify against.
 
@@ -136,5 +135,5 @@ def force_ipv4() -> None:
     _already_forced = True
     logger.info(
         "Outbound network forced to IPv4 for HTTP AND WebSocket connections "
-        "(avoids DhanHQ IPv6 whitelist rotation on any connection type)."
+        "(the broker's static-IP whitelist checks the IPv4 address orders leave from)."
     )

@@ -2,8 +2,8 @@
 run_options.py — standalone entry point for the NIFTY options engine.
 
 OPTIONS_PAPER_TRADING=true -> paper (simulated fills at live prices);
-false -> LIVE: real orders on Dhan. Market data (option chain, expiry,
-margin, candles, real-time premium ticks) always comes from DhanHQ.
+false -> LIVE: real orders on Zerodha (Kite Connect). Market data (quotes,
+expiries, margin, candles, real-time premium ticks) always comes from Kite.
 
 Logs stream to both console AND data/options_engine.log for monitoring.
 
@@ -34,7 +34,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 class _ShortNameFormatter(logging.Formatter):
-    """Every log line names its SOURCE module (engine / dhan_client /
+    """Every log line names its SOURCE module (engine / kite_client /
     websocket / ledger / run_options) — without this, the console shows
     only the message text and there's no way to tell which component
     produced any given line. Shortened to the last dotted component
@@ -146,30 +146,26 @@ _disable_console_quick_edit()
 
 
 def _token_status_line(config) -> str:
-    """DhanHQ tokens are valid 24h. If it lapses mid-session, the WebSocket
-    gets disconnected with code 807 ("Access Token is expired") — but the
-    SDK reports that via a bare print(), not our logger (see websocket.py),
-    so it would never show up in data/options_engine.log. This is the
-    proactive alternative: check it loudly, once, before that can happen."""
-    expires = token_expiry_ist(config.access_token.get_secret())
+    """Kite tokens work until 06:00 IST after the login (a fixed time, not 24 h).
+    Shown once, loudly; the startup check also asks Kite itself (main())."""
+    expires = token_expiry_ist(config.login_at)
     if expires is None:
-        return f"│  {'access token':<18} not a recognisable JWT — expiry unknown"
+        return f"│  {'access token':<18} login time unknown (KITE_LOGIN_AT) — checked with Kite at startup"
     now = datetime.now(_IST)
     remaining = (expires - now).total_seconds() / 3600.0
     line = f"│  {'access token':<18} valid to {expires:%d-%b %H:%M IST}"
     if remaining <= 0:
-        return line + "  *** EXPIRED — run: python scripts/auto_token.py ***"
+        return line + "  *** EXPIRED — log in: python scripts/kite_login.py ***"
     if _expires_during_session(expires, now):
-        return line + "  *** DIES DURING TODAY'S SESSION — regenerate before 09:15 ***"
+        return line + "  *** DIES DURING TODAY'S SESSION — log in again before 09:15 ***"
     if remaining < 2.0:
-        return line + f"  *** {remaining * 60:.0f} min left — regenerate now ***"
+        return line + f"  *** {remaining * 60:.0f} min left — log in again now ***"
     return line + f"  ({remaining:.1f}h left)"
 
 
 def _expires_during_session(expires: datetime, now: datetime) -> bool:
-    """A token generated at, say, 10:30 yesterday dies at 10:30 today —
-    mid-session, silently killing the feed with a position possibly open.
-    True when the token's expiry falls inside today's 09:15-15:30 window."""
+    """True when the token's expiry falls inside today's 09:15-15:30 window
+    (with Kite's 06:00 cut-off this only happens if KITE_LOGIN_AT is wrong)."""
     if expires.date() != now.date():
         return False
     open_, close_ = now.replace(hour=9, minute=15), now.replace(hour=15, minute=30)
@@ -200,13 +196,13 @@ def _print_banner(config) -> None:
         "╚" + "═" * 76 + "╝",
         _section("SESSION"),
         (f"│  {'capital':<18} Rs {config.paper_capital:,.0f}" if config.paper_trading
-         else f"│  {'capital':<18} Dhan available funds (never more than Rs {config.paper_capital:,.0f})"),
+         else f"│  {'capital':<18} Zerodha available margin (never more than Rs {config.paper_capital:,.0f})"),
         f"│  {'timeframe':<18} {tf}m Heikin-Ashi candles",
-        f"│  {'lot size':<18} {config.lot_size} (config default — live scrip-master value wins)",
+        f"│  {'lot size':<18} {config.lot_size} (config default — Kite's instrument list wins)",
         f"│  {'max lots/trade':<18} "
         + (f"{config.max_lots_per_trade}" if config.paper_trading
            else f"{min(config.max_lots_per_trade, config.live_max_lots)} (live cap)"),
-        f"│  {'sizing':<18} floor(capital / {config.max_concurrent} / live DhanHQ margin-per-lot)",
+        f"│  {'sizing':<18} floor(capital / {config.max_concurrent} / live Kite margin-per-lot)",
         _section("STRATEGY"),
         (f"│  {'entry':<18} HA GREEN -> RED: SELL parked at the exchange at candle 2's HA Low - "
          f"{config.entry_offset_pts:g}, fills during candle 3 (else cancelled); sell-to-open only"
@@ -240,22 +236,25 @@ def _print_banner(config) -> None:
         f"│  {'expiry':<18} nearest weekly" + (" — rolls to next week on expiry day" if config.roll_on_expiry_day else " (0 DTE on expiry day)"),
         *([] if config.paper_trading else [
             _section("LIVE ORDERS"),
-            f"│  {'account':<18} Dhan client {config.client_id}, product INTRADAY, NSE_FNO",
+            f"│  {'account':<18} Zerodha {config.client_id or '(user id: see the startup check)'}, product "
+            f"{config.product}, {config.option_exchange_segment}; orders only from the registered static IP",
             f"│  {'entry / exit':<18} {config.live_order_type}"
             + (f" (limit {config.live_limit_buffer_pct:.1f}% through the last price)" if config.live_order_type == "LIMIT" else ""),
             f"│  {'protective stop':<18} stop-limit AT THE EXCHANGE at the closer of the HA stop and the "
             f"profit lock, limit +{config.stop_limit_buffer_pct:.0f}%",
-            f"│  {'escalation':<18} stop crossed but unfilled after {config.stop_escalate_secs:.0f}s -> market buy-back",
+            f"│  {'escalation':<18} stop crossed but unfilled after {config.stop_escalate_secs:.0f}s -> market buy-back "
+            f"(market orders carry Kite's automatic market protection)",
             f"│  {'max lots':<18} {config.live_max_lots} per trade (hard cap)",
             f"│  {'daily loss limit':<18} Rs {config.max_daily_loss:,.0f} net — no new trades after it",
             f"│  {'kill switch':<18} create data/KILL -> square off everything and stop",
         ]),
         _section("COSTS"),
         f"│  {'model':<18} {costs}",
-        f"│  {'note':<18} rates are ESTIMATES — verify against a Dhan contract note",
+        f"│  {'note':<18} rates are ESTIMATES — verify against a Zerodha contract note",
         _section("DATA"),
         f"│  {'premium feed':<18} live WebSocket ticks; chain LTP as exit safety net",
-        f"│  {'spot':<18} REST option-chain poll every {config.chain_min_interval_secs:.0f}s (band only)",
+        f"│  {'spot / chain':<18} one batched Kite quote (all strikes + NIFTY 50) every "
+        f"{config.chain_min_interval_secs:.0f}s (strike picking only)",
         _token_status_line(config),
         _section("OUTPUT"),
         f"│  {'ledger':<18} {config.db_path}  (trades + events + candle_log)",
@@ -291,21 +290,24 @@ async def main() -> int:
         logger.info("Market has already closed for today (after %s IST). Nothing to do.", config.auto_stop_at)
         return 0
 
-    expires = token_expiry_ist(config.access_token.get_secret())
+    expires = token_expiry_ist(config.login_at)
     from algopilot.options.engine import KILL_SWITCH_FILE
     if KILL_SWITCH_FILE.exists():
         logger.error("Kill switch file %s exists — refusing to start. Delete it to run again.", KILL_SWITCH_FILE)
         return 1
 
     if expires is not None and expires <= datetime.now(_IST):
-        # BUG FIXED: the banner flagged an expired token but the engine ran
-        # anyway — every API call then failed with 401 and it sat doing
-        # nothing (no expiry list -> no chain -> no band -> no trades).
-        logger.error(
-            "Access token expired at %s. Refusing to start. Generate a new one "
-            "(python scripts/auto_token.py) and run again.",
-            f"{expires:%d-%b %H:%M IST}",
-        )
+        # An expired token means every API call fails and the engine would sit
+        # doing nothing (no expiry list -> no chain -> no strikes -> no trades).
+        logger.error("Kite access token expired at %s. Refusing to start. Log in (python scripts/kite_login.py) "
+                     "and run again.", f"{expires:%d-%b %H:%M IST}")
+        return 1
+    from algopilot.options.kite_auth import TokenError, verify
+    try:
+        user, name = await asyncio.to_thread(verify, config.api_key, config.access_token.get_secret())
+        logger.info("Kite session OK: %s (%s).", user, name)
+    except TokenError as exc:
+        logger.error("Refusing to start: %s", exc)
         return 1
 
     engine = OptionsEngine(config)

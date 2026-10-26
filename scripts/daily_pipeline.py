@@ -7,13 +7,12 @@ scripts/daily_pipeline.py — start it once; it trades every trading day by itse
     python scripts/daily_pipeline.py --uninstall  undo --install
 
 Running forever:
-  * every night at 21:00 IST — a new access token (PIN + TOTP, see auto_token.py),
-    checked with Dhan, written to .env. Dhan has no "revoke" call: the old token
-    is simply replaced and expires by itself. A token lasts 24 h, so tonight's
-    covers tomorrow's session. If the VM was off at 21:00, one is made before
-    the session instead.
+  * Zerodha requires a person to log in every trading day (Kite Connect tokens
+    end at 06:00 IST and can't be made without the login page). Each morning:
+        python scripts/kite_login.py     (on the VM, any time after 06:00)
   * every trading day from 08:45 IST — the session (run_day):
-      token valid for today? -> start the engine (python run_options.py)
+      today's Kite token valid? -> start the engine (python run_options.py)
+      not yet? -> wait, checking every minute, and start the moment you log in
       09:17-09:25: did NIFTY trade? if not (a closure missing from the holiday list), stop the engine
       engine crashed before the close? restart it (max 5; never with data/KILL); open positions resume
       the engine stops by itself after the close (15:31)
@@ -46,7 +45,7 @@ ensure_tls_trust_store()
 
 from dotenv import dotenv_values
 
-from algopilot.options.auto_token import TokenError, ensure_fresh_token
+from algopilot.options.kite_auth import TokenError, ensure_fresh_token
 from algopilot.utils.market_calendar import trading_day_status
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -56,7 +55,6 @@ LOG_FILE = Path("data/pipeline.log")
 LOCK_FILE = Path("data/pipeline.lock")
 STARTUP_FILE = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs\Startup\AlgoPilotX.cmd"
 
-NIGHT_TOKEN_AT = dtime(21, 0)
 SESSION_FROM = dtime(8, 45)
 OPEN_CHECK_FROM = dtime(9, 17)
 OPEN_CHECK_GIVE_UP = dtime(9, 25)
@@ -65,7 +63,7 @@ MAX_RESTARTS = 5
 RESTART_DELAY_SECS = 15
 POLL_SECS = 5
 LOOP_SECS = 30
-TOKEN_RETRY_SECS = 600
+TOKEN_WAIT_SECS = 60
 
 log = logging.getLogger("pipeline")
 
@@ -79,13 +77,13 @@ def now_ist() -> datetime:
 def market_opened_today(now: datetime):
     """True: NIFTY has traded today. False: nothing yet. None: couldn't ask."""
     try:
-        from algopilot.options.dhan_client import OptionsDhanClient
+        from algopilot.options.kite_client import OptionsKiteClient
         from algopilot.utils.secrets import SecretStr
         env = dotenv_values(".env")              # read fresh; never via os.environ (see _engine_env)
-        client = OptionsDhanClient(str(env.get("DHAN_CLIENT_ID", "")), SecretStr(str(env.get("DHAN_ACCESS_TOKEN", ""))))
+        client = OptionsKiteClient(str(env.get("KITE_API_KEY", "")), SecretStr(str(env.get("KITE_ACCESS_TOKEN", ""))))
         try:
             day = now.strftime("%Y-%m-%d")
-            rows = client.get_intraday_candles("13", "IDX_I", "INDEX", 1, f"{day} 09:00:00",
+            rows = client.get_intraday_candles("256265", "NSE", "INDEX", 1, f"{day} 09:00:00",   # NIFTY 50
                                                now.strftime("%Y-%m-%d %H:%M:%S"))
         finally:
             client.close()
@@ -98,12 +96,32 @@ def market_opened_today(now: datetime):
 
 
 def _engine_env() -> dict:
-    """The engine reads .env itself; no DHAN_* value inherited by this process
-    (an older token) may override the file the nightly refresh just wrote."""
+    """The engine reads .env itself; no KITE_* value inherited by this process
+    (an older token) may override the file the morning login just wrote."""
     env = os.environ.copy()
-    for key in ("DHAN_ACCESS_TOKEN", "DHAN_CLIENT_ID"):
+    for key in ("KITE_ACCESS_TOKEN", "KITE_API_KEY", "KITE_LOGIN_AT"):
         env.pop(key, None)
     return env
+
+
+def wait_for_login(token=ensure_fresh_token, now=now_ist, sleep=time.sleep) -> bool:
+    """True once today's Kite session works. Until then: one loud line, then a quiet
+    check every minute (a person must log in: python scripts/kite_login.py).
+    False if the day ends first."""
+    told = False
+    while True:
+        try:
+            log.info("Token: %s", token())
+            return True
+        except TokenError as exc:
+            if now().time() >= DAY_END:
+                log.critical("No Kite login today — the engine was NOT started. %s", exc)
+                return False
+            if not told:
+                log.critical("WAITING FOR TODAY'S KITE LOGIN — run on this machine: python scripts/kite_login.py "
+                             "(checking every %d s; the engine starts by itself). %s", TOKEN_WAIT_SECS, exc)
+                told = True
+        sleep(TOKEN_WAIT_SECS)
 
 
 def run_day(popen=subprocess.Popen, now=now_ist, sleep=time.sleep, opened=market_opened_today,
@@ -124,10 +142,7 @@ def run_day(popen=subprocess.Popen, now=now_ist, sleep=time.sleep, opened=market
     if STOP_FILE.exists():
         STOP_FILE.unlink()                       # a leftover stop request must not stop today's engine
 
-    try:
-        log.info("Token: %s", token())
-    except TokenError as exc:
-        log.critical("NO valid access token — the engine is NOT started today. %s", exc)
+    if not wait_for_login(token, now, sleep):
         return 2
 
     restarts, open_checked = 0, False
@@ -183,36 +198,27 @@ def run_day(popen=subprocess.Popen, now=now_ist, sleep=time.sleep, opened=market
         try:
             log.info("Token: %s", token())
         except TokenError as exc:
-            log.critical("NO valid access token for the restart — stopping for today. %s", exc)
+            log.critical("NO valid Kite session for the restart — stopping for today. %s", exc)
             return 2
 
 
 # ── forever ─────────────────────────────────────────────────────────────────
 
-def run_forever(now=now_ist, sleep=time.sleep, day=run_day, token=ensure_fresh_token, clock=time.monotonic,
-                max_loops=None) -> int:
-    """Nightly token at 21:00, a session every trading day from 08:45."""
-    token_done = session_done = None             # the date each was last done
-    retry_token_at = 0.0
+def run_forever(now=now_ist, sleep=time.sleep, day=run_day, max_loops=None) -> int:
+    """A session every trading day from 08:45 (it waits for that morning's Kite login)."""
+    session_done = None                          # the date it was last done
     loops = 0
-    log.info("Running every trading day: token every night at %s, session from %s IST. Ctrl+C to stop.",
-             NIGHT_TOKEN_AT.strftime("%H:%M"), SESSION_FROM.strftime("%H:%M"))
+    log.info("Running every trading day: session from %s IST (log in each morning: python scripts/kite_login.py). "
+             "Ctrl+C to stop.", SESSION_FROM.strftime("%H:%M"))
     while max_loops is None or loops < max_loops:
         loops += 1
         t = now()
-        if t.time() >= NIGHT_TOKEN_AT and token_done != t.date() and clock() >= retry_token_at:
-            try:
-                log.info("Nightly token: %s", token(force=True))
-                token_done = t.date()
-            except TokenError as exc:
-                log.error("Nightly token failed: %s — retrying in %d min.", exc, TOKEN_RETRY_SECS // 60)
-                retry_token_at = clock() + TOKEN_RETRY_SECS
         if SESSION_FROM <= t.time() < DAY_END and session_done != t.date():
             session_done = t.date()
             log.info("──── %s ────", t.strftime("%A %d-%b-%Y"))
             day()
-            log.info("Session over. Next: token at %s, next session from %s on the next trading day.",
-                     NIGHT_TOKEN_AT.strftime("%H:%M"), SESSION_FROM.strftime("%H:%M"))
+            log.info("Session over. Next session from %s on the next trading day (log in that morning).",
+                     SESSION_FROM.strftime("%H:%M"))
         sleep(LOOP_SECS)
     return 0
 

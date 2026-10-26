@@ -1,7 +1,8 @@
 # AGENTS.md — guide for AI coding agents
 
 AlgoPilotX Options: a **live, real-money** NIFTY weekly-options selling engine on
-DhanHQ v2. One asyncio Python process; Heikin-Ashi pattern on each option's own
+Zerodha Kite Connect v3 (branch `zerodha-conversion`; `final-dhan` is the DhanHQ v2
+version). One asyncio Python process; Heikin-Ashi pattern on each option's own
 premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 
 ## 1. Safety rules (never break these)
@@ -9,18 +10,20 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 1. **Real money.** With `OPTIONS_PAPER_TRADING=false` every order is real
    (account 1101141313). Never run the engine live to "try something".
 2. **Tests never place real orders.** Use paper mode or a fake broker object;
-   never construct a real `DhanBroker` call path in a test.
+   never construct a real `KiteBroker` call path in a test (tests/test_kite.py
+   replaces its HTTP with a fake Kite).
 3. **Never touch the production ledger** `data/options_ledger.db` in tests or
    experiments — give every test engine its own temporary `db_path`.
 4. **The strategy is frozen.** Do not change entry / exit / sizing rules
    without the owner's explicit approval. Infrastructure, logging, speed and
    realism fixes are fine; say what you changed.
-5. **Secrets.** `.env` (token), `secrets.env` (Dhan PIN + TOTP key) and
+5. **Secrets.** `.env` (token), `secrets.env` (KITE_API_SECRET) and
    `data/` are git-ignored — never commit, print, log or zip them. Never ask the
-   owner to paste the PIN or TOTP key in chat.
-6. **No token generation during market hours** (09:15–15:30 IST): a new token
-   can invalidate the one the running engine uses. The nightly job runs at 21:00.
-7. **Orders only from the VM.** Dhan accepts orders only from the registered
+   owner to paste the API secret, PIN or TOTP key in chat.
+6. **Daily login.** Kite tokens end at 06:00 IST; the owner logs in each
+   morning (`python scripts/kite_login.py`). Never log in again during market
+   hours while the engine runs, and never call DELETE /session/token.
+7. **Orders only from the VM.** Kite accepts orders only from the registered
    static IP (the Windows VM, 135.13.32.41). The VM updates with `git pull`;
    its `.env` / `secrets.env` / `data/` stay on the VM and are not changed by git.
 8. **Don't disturb a running engine** during market hours (no restarts, no
@@ -39,7 +42,8 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
 | `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
 | `version-6-ai` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 |
-| **`final-dhan`** | `v7.0`, `v7.1`, `v7.2` | **Current — the final Dhan version (LIVE).** Was `version-7`. Pure algorithm: `version-6-ai` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **50/2** (was 18/2) and strikes by premium **above ₹300** (was ₹100–150), plus the startup funds warning and `.gitattributes` |
+| `final-dhan` | `v7.0`, `v7.1`, `v7.2` | **The final Dhan version (LIVE).** Was `version-7`. Pure algorithm: `version-6-ai` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **50/2** (was 18/2) and strikes by premium **above ₹300** (was ₹100–150), plus the startup funds warning and `.gitattributes` |
+| **`zerodha-conversion`** | — | **Current.** `final-dhan`'s strategy, unchanged, on Zerodha Kite Connect v3 instead of DhanHQ: Kite HTTP + WebSocket, daily login, SL stops, market protection |
 | `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 
 Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
@@ -87,18 +91,22 @@ with validation.
 | `run_options.py` | Entry point: logging, startup banner, runs `OptionsEngine` |
 | `algopilot/options/engine.py` | The engine: candle clock, pattern, entries, exits, strikes, live order handling, state restore |
 | `algopilot/options/config.py` | All `OPTIONS_*` settings, defaults and validation |
-| `algopilot/options/broker.py` | Live orders (DhanBroker), order-update stream |
-| `algopilot/options/dhan_client.py` | Option chain, candles, margin, contract list |
+| `algopilot/options/broker.py` | Live orders (KiteBroker: SL / MARKET + market_protection / LIMIT), status mapping, order-update stream |
+| `algopilot/options/kite_client.py` | Chain = one batched /quote, candles (historical), margin (/margins/basket), contracts |
+| `algopilot/options/kite_api.py` | Kite HTTP: headers, envelope, errors, per-family rate limits |
+| `algopilot/options/instruments.py` | Daily instrument list: NIFTY options by (expiry, strike, CE/PE) and by token |
 | `algopilot/options/position.py` | Open position, HA trailing stop level, profit-lock level |
 | `algopilot/options/ledger.py` | SQLite ledger: trades, events, candle log, saved state |
 | `algopilot/options/websocket.py` | Live price feed |
 | `algopilot/options/charges.py` | Brokerage/STT/fees/GST model |
-| `algopilot/options/auto_token.py` | Token from PIN + TOTP |
+| `algopilot/options/kite_auth.py` | Login: checksum, session, token check, 06:00 expiry |
 | `algopilot/core/` | Candle builder, Heikin-Ashi |
 | `algopilot/strategy/` | GREEN→RED→RED state machine (`signal_engine.py`) |
 | `algopilot/utils/market_hours.py`, `market_calendar.py` | Session times, square-off time, NSE holidays |
-| `scripts/daily_pipeline.py` | Run-forever automation on the VM (token 21:00, session 08:45) |
-| `scripts/backtest.py` | Replays real Dhan days through the engine (opening spot band only) |
+| `scripts/daily_pipeline.py` | Run-forever automation on the VM (session 08:45, waits for the morning login) |
+| `scripts/kite_login.py` | The daily Kite login -> KITE_ACCESS_TOKEN |
+| `scripts/replay_day.py` | Replays a real day (Kite candles, still-listed expiries only) through the engine, paper |
+| `tests/` | Offline tests: `test_kite.py` (Kite layer + engine on a fake Kite), `test_strategy.py` |
 | `scripts/export_candle_log.py` | Candle-log tables/CSVs for analysis |
 
 Runtime files (git-ignored): `data/options_engine.log`, `data/options_ledger.db`,
@@ -107,7 +115,7 @@ Runtime files (git-ignored): `data/options_engine.log`, `data/options_ledger.db`
 ## 5. Working on it
 
 - **Verify with real data.** Before claiming a cause or a fix, reproduce it from
-  the real log / real Dhan candles and the engine's own code. Ask the owner for
+  the real log / real Kite candles and the engine's own code. Ask the owner for
   `data/options_engine.log` from the VM when a live issue is reported.
 - **Test offline**: a fake broker (orders, fills, positions, funds) and a fake
   margin client; temporary ledger; patch `get_market_status` for time. Check
@@ -124,6 +132,6 @@ Runtime files (git-ignored): `data/options_engine.log`, `data/options_ledger.db`
 - On 09-Oct the owner reported strike picking "not working" on the VM with
   version 4; the VM log has not been seen yet. Robustness fixes are in v5, but
   the real cause is unconfirmed.
-- `scripts/backtest.py` uses the opening spot band, not the premium picker.
+- Kite has no history for expired weekly options, so only days of a still-listed expiry can be replayed.
 - Month replays (07-Sep → 07-Oct) were net negative for every variant tested;
   charges (~₹7–9k/month at 1 lot) outweigh the gross edge.

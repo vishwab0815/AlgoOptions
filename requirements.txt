@@ -1,16 +1,15 @@
 # ── AlgoPilotX Options — Python dependencies ─────────────────────────────────
 # pip install -r requirements.txt
 
-# DhanHQ SDK — the live market-data WebSocket (MarketFeed).
-dhanhq>=2.0.0
-# Dhan's order-update stream (fills pushed to the engine).
-websockets>=12.0
+# Zerodha Kite Connect is used over plain HTTP + WebSocket (no SDK):
+# the live price feed and the order-update stream (wss://ws.kite.trade).
+websockets>=14.0
 
 # Candles and Heikin-Ashi.
 pandas>=2.0.0
 numpy>=1.26.0
 
-# REST calls to Dhan (orders, option chain, margin, candles, token).
+# REST calls to Kite (orders, quotes, margin, candles, login).
 requests>=2.31.0
 certifi==2025.8.3
 

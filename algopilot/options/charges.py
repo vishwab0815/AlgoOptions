@@ -12,7 +12,7 @@ NET numbers.
 
 Every rate below is CONFIGURABLE (see OptionsConfig) and every default is an
 ESTIMATE of publicly published Indian F&O rates. They change with budgets and
-exchange circulars. Check them against a real Dhan contract note before
+exchange circulars. Check them against a real Zerodha contract note before
 trusting the net figures, and override in .env if they differ:
 
     OPTIONS_BROKERAGE_PER_ORDER   flat fee per executed order

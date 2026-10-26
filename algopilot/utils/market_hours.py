@@ -10,7 +10,7 @@ reliable during the call auction phase.
 
 New ENTRIES are additionally gated out of two narrower windows inside the
 main session: 09:15-09:30 (post-open settle buffer) and 15:10-15:30 (our
-own pre-close EOD square-off buffer, ahead of Dhan's own ~15:18-15:19 RMS
+own pre-close EOD square-off buffer, ahead of Zerodha's own ~15:25 MIS auto square-off
 auto square-off — see should_square_off_now()). EXITS are never gated by
 either of these — an open position must always be closeable.
 
@@ -42,13 +42,11 @@ _MARKET_CLOSE = time(15, 25)  # 03:25 IST (5-min buffer before actual 03:30 clos
 # entries are gated.
 _ALGO_START_TIME = time(9, 30)  # 09:30 IST
 
-# DhanHQ's own Risk Management System (RMS) starts force-closing any open
-# INTRADAY position from 03:18-03:19 PM IST for NSE equity, at whatever price
-# it can get, plus an auto-square-off charge (₹20+GST) — confirmed directly
-# from Dhan's support docs (see should_square_off_now() below). New intraday
-# orders also stop being accepted from that same point. Our own engine
-# deliberately closes any open position a few minutes BEFORE that — at a
-# price we choose via our own market order, not Dhan's RMS — and stops
+# Zerodha's Risk Management System (RMS) force-closes any open MIS (intraday)
+# F&O position from about 03:25 PM IST, at whatever price it can get, plus an
+# auto-square-off charge (₹50 + GST), and refuses new MIS orders from then.
+# Our own engine deliberately closes any open position well BEFORE that — at a
+# price we choose via our own order, not Zerodha's RMS — and stops
 # opening brand-new positions from the same cutoff, so nothing we open this
 # late ever gets caught by our own square-off on its very next tick.
 _EOD_SQUAREOFF_TIME = time(15, 10)  # default; the engine sets it from OPTIONS_SQUAREOFF_AT
@@ -142,7 +140,7 @@ def get_market_status(now: datetime | None = None) -> MarketStatus:
         if squareoff_due:
             reason = (
                 f"EOD square-off window (from {squareoff_time()} IST) — no new entries; "
-                "any open position is being closed before Dhan's own 15:18-15:19 RMS cutoff."
+                "any open position is being closed before Zerodha's own ~15:25 MIS square-off."
             )
         elif algo_allowed:
             reason = "NSE/BSE regular trading session is active."
@@ -188,17 +186,13 @@ def should_square_off_now(now: datetime | None = None) -> bool:
     """
     True from the square-off time (15:10 IST, our own hard cutoff) through real market close — the
     window in which any still-open position should be force-closed by US,
-    at a price we choose, rather than left for DhanHQ's RMS to square off.
+    at a price we choose, rather than left for Zerodha's RMS to square off.
 
-    Confirmed directly from Dhan's own support docs (dhan.co/support —
-    "What are the Dhan Intraday auto square-off timings?" and "What is
-    intraday square-off?"): for NSE equity intraday (MIS) positions, Dhan's
-    RMS begins automatically closing anything still open from 15:18-15:19
-    IST "at the best available price", new intraday orders stop being
-    accepted from that same point, and a broker auto-square-off charge
-    (₹20 + GST) applies to whatever it closes. Squaring off ourselves a few
-    minutes earlier, at a price of our own choosing via a normal market
-    order, avoids both the fee and Dhan's less predictable execution price.
+    Zerodha's RMS closes MIS F&O positions still open from about 15:25 IST
+    "at the best available price", stops accepting new MIS orders from then,
+    and charges ₹50 + GST per squared-off order. Squaring off ourselves well
+    earlier, at a price of our own choosing via a normal order, avoids both
+    the fee and the RMS's less predictable execution price.
 
     Computed directly rather than via get_market_status() on purpose: this is
     called on EVERY tick for every open position, and get_market_status()
