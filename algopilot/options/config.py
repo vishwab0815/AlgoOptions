@@ -171,15 +171,16 @@ class OptionsConfig:
     profit_lock_start_pts: float = 5.0
     profit_lock_step_pts: float = 2.0
 
-    # Strikes. "premium": CE and PE each trade the strike whose premium is
-    # between premium_min and premium_max (in or out of the money); several in
-    # range -> the one closest to the middle (350). A side switches only while
-    # nothing is open or waiting, and only once its premium has left the range
-    # by more than premium_buffer (300-400, buffer 0: never kept under Rs 300).
+    # Strikes. "premium": CE and PE each trade by premium, in or out of the
+    # money. premium_max = 0 -> premium ABOVE premium_min, no upper limit: the
+    # strike just above it (version-7: above Rs 300). premium_max > premium_min
+    # -> between the two, closest to the middle. A side switches only while
+    # nothing is open or waiting, and only once its premium has dropped below
+    # premium_min - premium_buffer (or risen above premium_max + premium_buffer).
     # "spot": PUT = floor(spot/100)*100, CALL +100.
     strike_pick: str = "premium"
     premium_min: float = 300.0
-    premium_max: float = 400.0
+    premium_max: float = 0.0
     premium_buffer: float = 0.0
     strike_step: int = 100
 
@@ -312,10 +313,11 @@ def load_options_config() -> OptionsConfig:
         raise OptionsConfigError("OPTIONS_LOT_SIZE must be >= 1.")
 
     premium_min = float(os.getenv("OPTIONS_PREMIUM_MIN", "300"))
-    premium_max = float(os.getenv("OPTIONS_PREMIUM_MAX", "400"))
-    if not 0 < premium_min < premium_max:
+    premium_max = float(os.getenv("OPTIONS_PREMIUM_MAX", "0") or 0)
+    if premium_min <= 0 or (premium_max != 0 and premium_max <= premium_min):
         raise OptionsConfigError(
-            f"OPTIONS_PREMIUM_MIN ({premium_min:g}) must be above 0 and below OPTIONS_PREMIUM_MAX ({premium_max:g}).")
+            f"OPTIONS_PREMIUM_MIN ({premium_min:g}) must be above 0, and OPTIONS_PREMIUM_MAX ({premium_max:g}) "
+            "either 0 (no upper limit) or above MIN.")
     strike_step = int(os.getenv("OPTIONS_STRIKE_STEP", "100"))
     if strike_step not in (50, 100):
         raise OptionsConfigError(f"OPTIONS_STRIKE_STEP={strike_step} — use 100 or 50.")

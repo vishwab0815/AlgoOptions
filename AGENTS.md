@@ -39,7 +39,7 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
 | `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
 | `aiagent-version-6` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 |
-| **`version-7`** | `v7.0` | **Current.** Pure algorithm: `aiagent-version-6` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **5/2** (was 18/2) and strikes by premium **₹300–400** (was ₹100–150), plus the startup funds warning and `.gitattributes` |
+| **`version-7`** | `v7.0` | **Current.** Pure algorithm: `aiagent-version-6` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **5/2** (was 18/2) and strikes by premium **above ₹300** (was ₹100–150), plus the startup funds warning and `.gitattributes` |
 | `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 
 Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
@@ -53,8 +53,8 @@ from the one they name. Don't merge between strategy branches unasked.
 
 - **Strikes** (`OPTIONS_STRIKE_PICK=premium`): CE and PE picked separately —
   version-5: premium ₹100–150, several → closest to ₹125, kept while ₹95–155;
-  version-7: premium **₹300–400** (always above ₹300), several → closest to
-  ₹350, kept while ₹300–400 (buffer 0). In or out of the money. Never switched while
+  version-7: premium **above ₹300**, no upper limit (`OPTIONS_PREMIUM_MAX=0`) —
+  the strike just above ₹300, kept while ≥ ₹300. In or out of the money. Never switched while
   a position, a sell order, an entry in flight or a waiting pattern exists.
   Checked on every option-chain poll (~5 s).
 - **Pattern**: candle 1 GREEN, candle 2 RED (GREEN = HA close above HA open,

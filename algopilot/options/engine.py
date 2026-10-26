@@ -86,17 +86,23 @@ def resolve_band(spot: float) -> tuple:
     return put_strike, put_strike + 100.0
 
 
+def premium_rule(low: float, high: float) -> str:
+    """The strike rule in words, for the logs: "above Rs 300" or "Rs 100-150"."""
+    return f"above Rs {low:g}" if high <= 0 else f"Rs {low:g}-{high:g}"
+
+
 def pick_strike(chain, side: str, low: float, high: float, step: int) -> Optional[Tuple[float, float, bool]]:
     """(strike, premium, in range) for one side from the option chain, or None.
 
     By PREMIUM only — in or out of the money doesn't matter; CE and PE are
-    picked separately. Of the strikes on the `step` grid whose premium is
-    between `low` and `high`, the one closest to the middle of the range wins
-    (300-400 -> closest to 350; a tie -> the cheaper). If none is in range, the
-    one closest to the range. NIFTY 22,233, expiry day: CE 22100 Rs 145,
-    22200 Rs 112, 22300 Rs 78 -> CE 22200 (112 is closer to 125 than 145)."""
+    picked separately, on the `step` grid.
+    - high <= 0 (OPTIONS_PREMIUM_MAX=0): premium ABOVE `low` with no upper limit —
+      the cheapest strike at >= low, i.e. the one just above it. 26-Oct,
+      NIFTY 22,651: CE 22300 Rs 418, 22400 Rs 329, 22500 Rs 243 -> CE 22400.
+    - high > low: premium between `low` and `high`, the one closest to the middle
+      (100-150 -> closest to 125; a tie -> the cheaper).
+    If no strike qualifies: the one closest to the rule (flagged not in range)."""
     key = side.lower()
-    mid = (low + high) / 2.0
     quotes = []
     for strike, row in (chain.legs or {}).items():
         q = (row or {}).get(key)
@@ -105,6 +111,14 @@ def pick_strike(chain, side: str, low: float, high: float, step: int) -> Optiona
             quotes.append((float(strike), float(price)))
     if not quotes:
         return None
+    if high <= 0:
+        inside = [(k, p) for k, p in quotes if p >= low]
+        if inside:
+            k, p = min(inside, key=lambda x: x[1])
+            return k, p, True
+        k, p = max(quotes, key=lambda x: x[1])
+        return k, p, False
+    mid = (low + high) / 2.0
     inside = [(k, p) for k, p in quotes if low <= p <= high]
     if inside:
         k, p = min(inside, key=lambda x: (abs(x[1] - mid), x[1]))
@@ -1168,14 +1182,16 @@ class OptionsEngine:
 
     def _maybe_pick_strikes(self, chain) -> None:
         """OPTIONS_STRIKE_PICK=premium: CE and PE each trade the strike whose
-        premium is between OPTIONS_PREMIUM_MIN and _MAX (300-400), in or out of
-        the money — see pick_strike. Checked on every option-chain poll (~5 s).
+        premium is above OPTIONS_PREMIUM_MIN (_MAX=0: no upper limit; version-7:
+        above Rs 300), in or out of the money — see pick_strike. Checked on every
+        option-chain poll (~5 s).
 
         - Never while anything is open or waiting (band_frozen): a trade stays on
           its strike to the end even if its premium leaves the range — the range
           only chooses the strike for the NEXT trade.
-        - A side keeps its strike while the premium stays within the range +/-
-          OPTIONS_PREMIUM_BUFFER (0: kept only while 300-400).
+        - A side keeps its strike while the premium stays at MIN - BUFFER or
+          above (and, with a MAX, at MAX + BUFFER or below). Version-7: kept
+          while >= Rs 300; below it, the strike just above Rs 300 is taken.
         - No strike in range: a side keeps the strike it has; at the very start
           it takes the closest one, with a warning.
         - Each side on its own: a side with no price yet doesn't hold the other
@@ -1190,7 +1206,7 @@ class OptionsEngine:
             cur = self.call_strike if side == "CE" else self.put_strike
             q = ((chain.legs or {}).get(cur) or {}).get(side.lower()) if cur is not None else None
             price = getattr(q, "last_price", 0.0) or 0.0
-            if cur is not None and (price <= 0 or lo - buf <= price <= hi + buf):
+            if cur is not None and (price <= 0 or (lo - buf <= price and (hi <= 0 or price <= hi + buf))):
                 new[side] = cur                       # still fits (or no price this poll): keep it
                 continue
             pick = pick_strike(chain, side, lo, hi, cfg.strike_step)
@@ -1203,11 +1219,11 @@ class OptionsEngine:
                 was = f"{cur:.0f} (Rs {price:.2f}) -> " if cur is not None else ""
                 notes.append(f"{side} {was}{strike:.0f} (Rs {prem:.2f}{'' if inside else ', NOT in range'})")
                 if not inside:
-                    logger.warning("[%-2s] no strike has a premium of Rs %g-%g — using %.0f (Rs %.2f), the closest.",
-                                   side, lo, hi, strike, prem)
+                    logger.warning("[%-2s] no strike has a premium %s — using %.0f (Rs %.2f), the closest.",
+                                   side, premium_rule(lo, hi), strike, prem)
         if new["PE"] == self.put_strike and new["CE"] == self.call_strike:
             return
-        logger.info("Strikes picked by premium (Rs %g-%g): %s | NIFTY %.2f", lo, hi, " / ".join(notes), chain.spot)
+        logger.info("Strikes picked by premium %s: %s | NIFTY %.2f", premium_rule(lo, hi), " / ".join(notes), chain.spot)
         changed = [s for s in _LEGS if new[s] != (self.call_strike if s == "CE" else self.put_strike)]
         self.put_strike, self.call_strike = new["PE"], new["CE"]
         for side in changed:                          # a new contract: its own candles, its own pattern

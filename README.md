@@ -13,11 +13,11 @@ orders**, recording everything in a local SQLite ledger.
 ## Strategy
 
 1. **Strikes** — by premium (`OPTIONS_STRIKE_PICK=premium`): CE and PE are picked
-   **separately**, each the strike whose premium is **₹300–400** (always above
-   ₹300, so in the money) — in or out of the money doesn't matter. Several in
-   range → the one closest to ₹350. NIFTY 22,700: CE 22400 ₹330 / CE 22500 ₹255
-   → **CE 22400**. A side keeps its strike while its premium stays ₹300–400
-   (`OPTIONS_PREMIUM_BUFFER=0`), and never switches while a trade or
+   **separately**, each the strike whose premium is **above ₹300**, no upper
+   limit — the strike just above ₹300 (in or out of the money doesn't matter).
+   26-Oct, NIFTY 22,651: CE 22300 ₹418 / **CE 22400 ₹329** / CE 22500 ₹243 →
+   **CE 22400**. A side keeps its strike while its premium stays ₹300 or above
+   (`OPTIONS_PREMIUM_MAX=0`, `OPTIONS_PREMIUM_BUFFER=0`), and never switches while a trade or
    order is open or a pattern is waiting — the range only picks the strike for
    the next trade, it never closes one. Checked every ~5 s. (`spot` = PUT = NIFTY
    rounded down to the hundred, CALL = +100.)
