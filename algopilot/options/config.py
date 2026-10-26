@@ -173,14 +173,14 @@ class OptionsConfig:
 
     # Strikes. "premium": CE and PE each trade the strike whose premium is
     # between premium_min and premium_max (in or out of the money); several in
-    # range -> the one closest to the middle (125). A side switches only while
+    # range -> the one closest to the middle (350). A side switches only while
     # nothing is open or waiting, and only once its premium has left the range
-    # by more than premium_buffer (95-155). "spot": PUT = floor(spot/100)*100,
-    # CALL +100.
+    # by more than premium_buffer (300-400, buffer 0: never kept under Rs 300).
+    # "spot": PUT = floor(spot/100)*100, CALL +100.
     strike_pick: str = "premium"
-    premium_min: float = 100.0
-    premium_max: float = 150.0
-    premium_buffer: float = 5.0
+    premium_min: float = 300.0
+    premium_max: float = 400.0
+    premium_buffer: float = 0.0
     strike_step: int = 100
 
     # No new entries before this IST time (HH:MM). 09:15 = from the open
@@ -311,8 +311,8 @@ def load_options_config() -> OptionsConfig:
     if lot_size < 1:
         raise OptionsConfigError("OPTIONS_LOT_SIZE must be >= 1.")
 
-    premium_min = float(os.getenv("OPTIONS_PREMIUM_MIN", "100"))
-    premium_max = float(os.getenv("OPTIONS_PREMIUM_MAX", "150"))
+    premium_min = float(os.getenv("OPTIONS_PREMIUM_MIN", "300"))
+    premium_max = float(os.getenv("OPTIONS_PREMIUM_MAX", "400"))
     if not 0 < premium_min < premium_max:
         raise OptionsConfigError(
             f"OPTIONS_PREMIUM_MIN ({premium_min:g}) must be above 0 and below OPTIONS_PREMIUM_MAX ({premium_max:g}).")
@@ -360,7 +360,7 @@ def load_options_config() -> OptionsConfig:
         strike_pick=_strike_pick(os.getenv("OPTIONS_STRIKE_PICK", "premium")),
         premium_min=premium_min,
         premium_max=premium_max,
-        premium_buffer=max(0.0, float(os.getenv("OPTIONS_PREMIUM_BUFFER", "5"))),
+        premium_buffer=max(0.0, float(os.getenv("OPTIONS_PREMIUM_BUFFER", "0"))),
         strike_step=strike_step,
         entry_start=_hhmm(os.getenv("OPTIONS_ENTRY_START", "09:15")),
         roll_on_expiry_day=os.getenv("OPTIONS_ROLL_ON_EXPIRY_DAY", "false").strip().lower() == "true",

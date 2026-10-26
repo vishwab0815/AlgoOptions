@@ -92,7 +92,7 @@ def pick_strike(chain, side: str, low: float, high: float, step: int) -> Optiona
     By PREMIUM only — in or out of the money doesn't matter; CE and PE are
     picked separately. Of the strikes on the `step` grid whose premium is
     between `low` and `high`, the one closest to the middle of the range wins
-    (100-150 -> closest to 125; a tie -> the cheaper). If none is in range, the
+    (300-400 -> closest to 350; a tie -> the cheaper). If none is in range, the
     one closest to the range. NIFTY 22,233, expiry day: CE 22100 Rs 145,
     22200 Rs 112, 22300 Rs 78 -> CE 22200 (112 is closer to 125 than 145)."""
     key = side.lower()
@@ -1168,14 +1168,14 @@ class OptionsEngine:
 
     def _maybe_pick_strikes(self, chain) -> None:
         """OPTIONS_STRIKE_PICK=premium: CE and PE each trade the strike whose
-        premium is between OPTIONS_PREMIUM_MIN and _MAX (100-150), in or out of
+        premium is between OPTIONS_PREMIUM_MIN and _MAX (300-400), in or out of
         the money — see pick_strike. Checked on every option-chain poll (~5 s).
 
         - Never while anything is open or waiting (band_frozen): a trade stays on
           its strike to the end even if its premium leaves the range — the range
           only chooses the strike for the NEXT trade.
         - A side keeps its strike while the premium stays within the range +/-
-          OPTIONS_PREMIUM_BUFFER (95-155): no switching on every tick near 100.
+          OPTIONS_PREMIUM_BUFFER (0: kept only while 300-400).
         - No strike in range: a side keeps the strike it has; at the very start
           it takes the closest one, with a warning.
         - Each side on its own: a side with no price yet doesn't hold the other
