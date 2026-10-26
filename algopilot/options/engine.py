@@ -291,6 +291,7 @@ class OptionsEngine:
         self.client = OptionsKiteClient(
             config.api_key, config.access_token, product=config.product,
             chain_min_interval_secs=config.chain_min_interval_secs,
+            cache_dir=str(Path(config.db_path).parent),    # instrument list next to the ledger
         )
         self.ledger = OptionsLedger(config.db_path)
         self.ws_manager: Optional[OptionsWebSocketManager] = None
