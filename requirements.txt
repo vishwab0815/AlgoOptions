@@ -17,8 +17,5 @@ certifi==2025.8.3
 # .env / secrets.env
 python-dotenv>=1.0.0
 
-# AI options strategist (algopilot/agent) — Claude API.
-anthropic>=1.0,<2
-
 # IST time zone data (needed on Windows).
 tzdata>=2024.1

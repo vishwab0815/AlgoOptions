@@ -352,12 +352,6 @@ class OptionsEngine:
         # order is placed then (see _place_waiting_order). (side, leg, candle 2,
         # HA Low, HA High, candle-3 window, candle-3 end)
         self._waiting: Optional[tuple] = None
-        # The AI options strategist (OPTIONS_AI_AGENT): analyses at 1/3, can block
-        # the sell at 2/3. None = off; the engine then trades exactly as before.
-        self.agent = None
-        if config.ai_agent:
-            from ..agent import TradeAgent
-            self.agent = TradeAgent(config, self.ledger, config.client_id, config.access_token.get_secret())
 
         self._charge_rates = ChargeRates(
             brokerage_per_order=config.brokerage_per_order,
@@ -417,8 +411,6 @@ class OptionsEngine:
             await self._reconcile_live()
 
         await self._prewarm()
-        if self.agent is not None:
-            await self.agent.start()
 
         self.ws_manager = OptionsWebSocketManager(
             config=self.config,
@@ -433,8 +425,6 @@ class OptionsEngine:
         # loop (a chain poll mid-HTTP, a backfill) can ever sit in front of
         # the boundary. See _candle_clock().
         self._spawn(self._candle_clock())
-        if self.agent is not None and self.config.ai_preclose_secs > 0:
-            self._spawn(self._ai_preclose_clock())
         if self.broker is not None:
             # Fills are PUSHED by Dhan (see broker.OrderUpdateStream) — the
             # fast way to know an order filled; REST polling stays as fallback.
@@ -469,11 +459,6 @@ class OptionsEngine:
             if self.broker is not None and self.broker.stream is not None:
                 await self.broker.stream.stop()
             await self._cancel_background_tasks()
-            if self.agent is not None:
-                try:
-                    await self.agent.close()
-                except Exception:
-                    logger.exception("AI agent: shutdown failed.")
             self.client.close()
             if self.broker is not None:
                 self.broker.close()
@@ -910,8 +895,6 @@ class OptionsEngine:
                 chain = await self.client.get_chain_async(
                     self.config.nifty_security_id, self.config.nifty_index_segment, self.expiry,
                 )
-                if self.agent is not None and chain is not None and self.client.last_chain_payload:
-                    self.agent.on_chain(self.client.last_chain_payload)
                 if chain is not None and chain.spot > 0:
                     band_was_unset = self.put_strike is None and self.call_strike is None
                     if band_was_unset:
@@ -1366,9 +1349,6 @@ class OptionsEngine:
             synthetic=getattr(candle, "synthetic", False),
         )
 
-        if self.agent is not None and color == "GREEN" and self._ai_should_analyse(side, leg, candle):
-            self.agent.prepare(self._ai_ctx(side, leg, "1/3", window))
-
         if self.config.entry_mode == "break":
             # Version 2: candle 2 (RED right after a GREEN) has just closed —
             # its HA Low is final, so the SELL can be parked now and fill during
@@ -1482,12 +1462,6 @@ class OptionsEngine:
                                       details=f"candle={window} reason={reason} ha_close=0")
                 continue
             ready[side] = (leg, candle, level, high, window)
-        if len(ready) == 2 and self.agent is not None:
-            for s in list(ready):
-                leg_s, candle_s, level_s, high_s, window_s = ready[s]
-                v = await self._ai_verdict(s, leg_s, candle_s, level_s, high_s, window_s)
-                if not v.allow:
-                    del ready[s]
         if len(ready) == 2:
             count = {s: self._trades_today(s) for s in ready}
             gap = {s: self._price_now(s, ready[s][1].close) - self._sell_price_for(ready[s][2]) for s in ready}
@@ -1576,12 +1550,6 @@ class OptionsEngine:
         stop = high + self.config.stop_offset_pts       # candle 2's HA High + the stop offset
         self._entry_in_flight = side                 # strikes can't switch from here on
         try:
-            if self.agent is not None:
-                v = await self._ai_verdict(side, leg, candle2, level, high, window)
-                if leg is not self.legs.get(side):
-                    return
-                if not v.allow:
-                    return
             lots, qty, per_lot, margin_live = await self._size_entry(side, leg, trigger)
             if leg is not self.legs.get(side):
                 return
@@ -1644,128 +1612,6 @@ class OptionsEngine:
             self._spawn(self._watch_armed(a))
         finally:
             self._entry_in_flight = None
-
-    # ── AI strategist hooks ─────────────────────────────────────────────────
-
-    def _ai_should_analyse(self, side: str, leg: LegState, candle: Candle) -> bool:
-        """Only analyse a GREEN that could still lead to a sell today."""
-        if leg.position is not None or self.client.auth_failed:
-            return False
-        if self.config.max_trades_per_day > 0 and self._trades_today_total() >= self.config.max_trades_per_day:
-            return False
-        if self.config.max_daily_loss > 0 and self.realized_pnl <= -self.config.max_daily_loss:
-            return False
-        if leg.security_id in self._blocked_contracts or leg.security_id in self._foreign_contracts:
-            return False
-        tf = timedelta(seconds=self.config.candle_timeframe_secs)
-        return not get_market_status(now=candle.end_ts + 2 * tf).eod_squareoff_due
-
-    async def _ai_preclose_clock(self) -> None:
-        """OPTIONS_AI_PRECLOSE_SECS before every candle close: a candle 2 that is forming
-        RED gets its AI check now, so the answer is ready when the sell order is due."""
-        tf = self.config.candle_timeframe_secs
-        lead = self.config.ai_preclose_secs
-        while self._running:
-            boundary = (time.time() // tf + 1) * tf
-            if boundary - time.time() < lead:
-                boundary += tf
-            await asyncio.sleep(max(0.0, boundary - lead - time.time()))
-            try:
-                self._ai_preclose(datetime.fromtimestamp(boundary, tz=timezone.utc))
-            except Exception:
-                logger.exception("AI pre-close check failed to start.")
-
-    def _ai_preclose(self, boundary: datetime) -> None:
-        """Start the pre-close AI check for every side whose candle 2 is forming RED."""
-        mkt = get_market_status(now=boundary)
-        if not mkt.is_trading_allowed or mkt.eod_squareoff_due:
-            return
-        tf = timedelta(seconds=self.config.candle_timeframe_secs)
-        for side in _LEGS:
-            leg = self.legs.get(side)
-            if leg is None or not leg.security_id or leg.setup_stage != SignalEngine.STAGE_GREEN_SEEN:
-                continue
-            builder = leg.candle_builder
-            cur, start = getattr(builder, "_current", None), getattr(builder, "_current_start", None)
-            df = leg.ha_engine.df
-            if not cur or start is None or start != boundary - tf or df is None or df.empty:
-                continue
-            prev = df.iloc[-1]
-            o, h, l, c = (float(cur[k]) for k in ("open", "high", "low", "close"))
-            ha_close = (o + h + l + c) / 4.0
-            ha_open = (float(prev["ha_open"]) + float(prev["ha_close"])) / 2.0
-            if ha_close > ha_open:
-                continue                                  # candle 2 is GREEN so far: no sell coming
-            candle2 = Candle(symbol=side, exchange_segment=2, security_id=leg.security_id, start_ts=start,
-                             end_ts=boundary, open=o, high=h, low=l, close=c, volume=0.0)
-            if not self._ai_should_analyse(side, leg, candle2):
-                continue
-            window = f"{start.astimezone(_IST):%H:%M}-{boundary.astimezone(_IST):%H:%M}"
-            ctx = self._ai_ctx(side, leg, "2/3-pre", window, candle2, min(l, ha_open, ha_close),
-                               max(h, ha_open, ha_close))
-            ctx["pattern"]["candle2_provisional_ha"] = {"ha_open": round(ha_open, 2), "ha_close": round(ha_close, 2),
-                                                        "raw_ohlc_so_far": [o, h, l, c]}
-            self.agent.prepare(ctx)
-
-    def _ai_today(self) -> dict:
-        """Today's trades per side, for the strategist."""
-        out = {"CE": [], "PE": []}
-        for t in sorted(self.ledger.get_today_trades(), key=lambda x: str(x.get("entry_time", ""))):
-            side = t.get("leg")
-            if side not in out:
-                continue
-            try:
-                at = datetime.fromisoformat(str(t.get("entry_time"))).astimezone(_IST).strftime("%H:%M")
-            except ValueError:
-                at = ""
-            out[side].append({"time": at, "strike": t.get("strike"), "sold": t.get("entry_price"),
-                              "bought_back": round(float(t.get("exit_price") or 0), 2), "exit": t.get("exit_reason"),
-                              "net_rs": round(float(t.get("pnl") or 0))})
-        for side in out:
-            if self.legs[side].position is not None:
-                p = self.legs[side].position
-                out[side].append({"time": p.entry_time.astimezone(_IST).strftime("%H:%M"), "sold": p.entry_price,
-                                  "open_now": True, "stop": round(p.cover_level, 2)})
-        return {"trades_ce": out["CE"], "trades_pe": out["PE"],
-                "net_ce_rs": sum(x.get("net_rs", 0) for x in out["CE"]),
-                "net_pe_rs": sum(x.get("net_rs", 0) for x in out["PE"])}
-
-    def _ai_ctx(self, side: str, leg: LegState, stage: str, window: str, candle2: Optional[Candle] = None,
-                level: Optional[float] = None, high: Optional[float] = None) -> dict:
-        df = leg.ha_engine.df
-        last = [{k: round(float(r[k]), 2) for k in ("ha_open", "ha_high", "ha_low", "ha_close")}
-                for _, r in df.tail(4).iterrows()] if df is not None and len(df) else []
-        pattern = {"side": side, "stage": stage, "window": window, "strike": leg.strike,
-                   "security_id": leg.security_id,
-                   "option_ltp": self._last_premium.get(side), "last_4_ha_candles_of_this_option": last}
-        if candle2 is not None and level is not None and high is not None:
-            pattern.update(candle2_end=candle2.end_ts.isoformat(), candle2_ha_low=round(level, 2),
-                           candle2_ha_high=round(high, 2), sell_price=self._sell_price_for(level),
-                           stop=round(high + self.config.stop_offset_pts, 2),
-                           risk_to_stop_pts=round(high + self.config.stop_offset_pts - self._sell_price_for(level), 2))
-        other = "PE" if side == "CE" else "CE"
-        now = datetime.now(_IST)
-        sq = now.replace(hour=int(self.config.squareoff_at[:2]), minute=int(self.config.squareoff_at[3:]), second=0)
-        engine = {"expiry": self.expiry, "expiry_day": self.expiry == now.date().isoformat(),
-                  "minutes_to_squareoff": max(0, int((sq - now).total_seconds() // 60)),
-                  "trades_today": self._trades_today_total(), "max_trades_per_day": self.config.max_trades_per_day,
-                  "net_pnl_today_rs": round(self.realized_pnl, 2), "daily_loss_limit_rs": self.config.max_daily_loss,
-                  "other_side_trade_open": self.legs[other].position is not None,
-                  "profit_lock": f"{self.config.profit_lock_start_pts:g}/{self.config.profit_lock_step_pts:g}" if self.config.profit_lock else "off"}
-        return {"pattern": pattern, "engine": engine, "today": self._ai_today()}
-
-    async def _ai_verdict(self, side: str, leg: LegState, candle2: Candle, level: float, high: float, window: str):
-        """Ask the strategist at 2/3 and log the outcome. The agent never raises."""
-        v = await self.agent.decide(self._ai_ctx(side, leg, "2/3", window, candle2, level, high))
-        if v.source != "ai":
-            logger.info("[%-2s] %s IST    -> %s.", side, window, v.headline())
-        elif v.allow:
-            logger.info("[%-2s] %s IST    -> %s -> SELL ORDER GOES IN (%s)", side, window, v.headline(), v.note or v.stage)
-        else:
-            logger.info("[%-2s] %s IST    -> %s -> NO SELL ORDER (%s)", side, window, v.headline(), v.note or v.stage)
-            self.ledger.log_event("SIGNAL_SKIPPED", symbol=side, details=(
-                f"candle={window} reason=AI {v.decision} {v.confidence}% (push {v.push_state}) ha_close=0"))
-        return v
 
     async def _place_waiting_order(self, closed_at: datetime) -> None:
         """The other side's trade just closed. If the waiting pattern's candle 3
@@ -2797,8 +2643,7 @@ class OptionsEngine:
             need = self.config.fallback_margin_per_lot
             if funds < need:
                 logger.critical("FUNDS TOO LOW: Rs %.0f in Dhan, about Rs %.0f needed for 1 lot. NO sell order can be "
-                                "placed today until funds are added (15-Oct, 19-Oct, 21-Oct: every AI SELL was refused "
-                                "for this).", funds, need)
+                                "placed today until funds are added.", funds, need)
 
     async def _kill_switch(self) -> None:
         logger.critical("KILL SWITCH (%s exists) — squaring off everything and stopping.", KILL_SWITCH_FILE)

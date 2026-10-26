@@ -145,9 +145,6 @@ class OptionsDhanClient:
         self._chain_next_allowed = 0.0   # monotonic epoch; 0 = allowed immediately
         self._margin_limiter = RateLimiter(rate=_MARGIN_RATE_PER_SEC, capacity=1)
         self._margin_cache: Dict[str, Tuple[float, float]] = {}
-        # The raw payload of the last option-chain poll (greeks, IV, OI, bid/ask):
-        # the AI agent reads it instead of asking Dhan again (1 chain request / 3 s).
-        self.last_chain_payload: Optional[dict] = None
         self._scrip_cache_path = Path(scrip_cache_path)
         # (expiry YYYY-MM-DD, strike, "CE"|"PE") -> ContractInfo
         self._scrip_index: Optional[Dict[Tuple[str, float, str], ContractInfo]] = None
@@ -251,7 +248,6 @@ class OptionsDhanClient:
                 return None
             resp.raise_for_status()
             payload = resp.json().get("data", {})
-            self.last_chain_payload = payload
             spot = float(payload.get("last_price", 0.0))
             legs: Dict[float, Dict[str, LegQuote]] = {}
             for strike_str, row in (payload.get("oc") or {}).items():

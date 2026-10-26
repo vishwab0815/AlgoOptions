@@ -95,7 +95,7 @@ def _flush_logs() -> None:
 atexit.register(_flush_logs)
 
 # Third-party libraries are noisy at INFO and add nothing here.
-for _noisy in ("urllib3", "websockets", "asyncio", "httpx", "httpx2", "httpcore", "anthropic"):
+for _noisy in ("urllib3", "websockets", "asyncio"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger("run_options")
@@ -231,10 +231,6 @@ def _print_banner(config) -> None:
         (f"│  {'profit lock':<18} {config.profit_lock_start_pts:g} pts below entry, then every "
          f"{config.profit_lock_step_pts:g} pts (one step behind); buy back when it comes back"
          if config.profit_lock else f"│  {'profit lock':<18} off"),
-        (f"│  {'AI strategist':<18} {config.ai_model} (effort {config.ai_effort}) checks every pattern: the sell "
-         f"goes in only at >= {config.ai_min_confidence}% confidence; pre-close check "
-         f"{f'{config.ai_preclose_secs} s before candle 2 closes' if config.ai_preclose_secs else 'off'}; news {config.ai_news_model}; "
-         f"budget ${config.ai_daily_budget_usd:g}/day" if config.ai_agent else f"│  {'AI strategist':<18} off"),
         f"│  {'candle close':<18} exactly at the boundary"
         + (f" + {config.candle_close_grace_ms} ms grace" if config.candle_close_grace_ms else " (hh:mm:00.000), exchange trade time"),
         f"│  {'expiry':<18} nearest weekly" + (" — rolls to next week on expiry day" if config.roll_on_expiry_day else " (0 DTE on expiry day)"),

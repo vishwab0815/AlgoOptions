@@ -220,27 +220,6 @@ class OptionsConfig:
     # after any 429 (see dhan_client.py).
     chain_min_interval_secs: float = 5.0
 
-    # AI options strategist (algopilot/agent). On a GREEN candle (1/3) it analyses
-    # the market; when candle 2 turns RED (2/3) the sell order goes in only if it
-    # says SELL with at least ai_min_confidence. If it is slow, failing or over
-    # the daily budget, the pattern is traded as without it. Needs ANTHROPIC_API_KEY.
-    ai_agent: bool = False
-    ai_model: str = "claude-opus-5-5"
-    ai_news_model: str = "claude-sonnet-5-5"
-    ai_effort: str = "high"
-    ai_min_confidence: int = 35
-    # Seconds before candle 2 closes that a candle forming RED gets its AI check
-    # (the answer is then ready when the sell order is due). 0 = off.
-    ai_preclose_secs: int = 60
-    ai_prepare_timeout_secs: float = 150.0
-    ai_decide_timeout_secs: float = 25.0
-    ai_daily_budget_usd: float = 5.0
-    ai_news_every_mins: int = 0
-    # A pattern whose bucket (our option's OI flow, stop size, time of day, push given
-    # back, VIX, trend) won <= 25% of >= 10 real sells in the last 20 days is a weak
-    # setup: the sell then needs this confidence instead of OPTIONS_AI_MIN_CONFIDENCE.
-    ai_weak_setup_confidence: int = 50
-
 
 def _squareoff(raw: str) -> str:
     hhmm = _hhmm(raw)
@@ -248,33 +227,6 @@ def _squareoff(raw: str) -> str:
         raise OptionsConfigError(f"OPTIONS_SQUAREOFF_AT={raw!r} — use a time between 09:20 and 15:15 "
                                  "(Dhan squares off intraday positions itself from about 15:18).")
     return hhmm
-
-
-def _ai_settings(entry_mode: str) -> dict:
-    on = os.getenv("OPTIONS_AI_AGENT", "false").strip().lower() == "true"
-    effort = os.getenv("OPTIONS_AI_EFFORT", "high").strip().lower()
-    if effort not in ("low", "medium", "high", "xhigh", "max"):
-        raise OptionsConfigError(f"OPTIONS_AI_EFFORT={effort!r} — use low, medium, high, xhigh or max.")
-    conf = int(os.getenv("OPTIONS_AI_MIN_CONFIDENCE", "35"))
-    if not 0 <= conf <= 100:
-        raise OptionsConfigError(f"OPTIONS_AI_MIN_CONFIDENCE={conf} — use 0 to 100.")
-    weak = int(os.getenv("OPTIONS_AI_WEAK_SETUP_CONFIDENCE", "50"))
-    if not conf <= weak <= 100:
-        raise OptionsConfigError(f"OPTIONS_AI_WEAK_SETUP_CONFIDENCE={weak} — use {conf} (= MIN_CONFIDENCE) to 100.")
-    budget = _positive(os.getenv("OPTIONS_AI_DAILY_BUDGET_USD", "5"), "OPTIONS_AI_DAILY_BUDGET_USD")
-    prep = _positive(os.getenv("OPTIONS_AI_PREPARE_TIMEOUT_SECS", "150"), "OPTIONS_AI_PREPARE_TIMEOUT_SECS")
-    decide = _positive(os.getenv("OPTIONS_AI_DECIDE_TIMEOUT_SECS", "25"), "OPTIONS_AI_DECIDE_TIMEOUT_SECS")
-    pre = int(os.getenv("OPTIONS_AI_PRECLOSE_SECS", "60"))
-    if pre != 0 and not 20 <= pre <= 240:
-        raise OptionsConfigError(f"OPTIONS_AI_PRECLOSE_SECS={pre} — use 0 (off) or 20 to 240 seconds.")
-    if on and not os.getenv("ANTHROPIC_API_KEY", "").strip():
-        raise OptionsConfigError("OPTIONS_AI_AGENT=true needs ANTHROPIC_API_KEY in .env (or set OPTIONS_AI_AGENT=false).")
-    if on and entry_mode != "break":
-        raise OptionsConfigError("OPTIONS_AI_AGENT=true works with OPTIONS_ENTRY_MODE=break only.")
-    return dict(ai_agent=on, ai_model=os.getenv("OPTIONS_AI_MODEL", "claude-opus-5-5").strip(),
-                ai_news_model=os.getenv("OPTIONS_AI_NEWS_MODEL", "claude-sonnet-5-5").strip(), ai_effort=effort,
-                ai_min_confidence=conf, ai_weak_setup_confidence=weak, ai_preclose_secs=pre, ai_prepare_timeout_secs=prep, ai_decide_timeout_secs=decide,
-                ai_daily_budget_usd=budget, ai_news_every_mins=max(0, int(os.getenv("OPTIONS_AI_NEWS_EVERY_MINS", "0"))))
 
 
 def _strike_pick(raw: str) -> str:
@@ -424,5 +376,4 @@ def load_options_config() -> OptionsConfig:
         gst_pct=float(os.getenv("OPTIONS_GST_PCT", "18.0")),
         poll_interval_secs=float(os.getenv("OPTIONS_POLL_INTERVAL_SECS", "1.0")),
         chain_min_interval_secs=chain_min_interval,
-        **_ai_settings(_entry_mode(os.getenv("OPTIONS_ENTRY_MODE", "break"))),
     )
