@@ -30,15 +30,20 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 
 ## 2. Branches
 
-| Branch | What it is |
-|---|---|
-| `main` | Original strategy (GREEN→RED→RED at candle 3's close), older code |
-| `version-2` / `version-3` | History: early sell order (HA Low − 1 / − 0.5), offsets, 15:10 |
-| `version-4` | v3 + fresh-funds fix, pre-close warm-up, doji rule, strikes by premium (OTM) |
-| `version-5` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
-| **`aiagent-version-6`** | **Current.** version-5 + the AI options strategist (`algopilot/agent`): analyses at 1/3, can block the sell at 2/3 |
-| `old-strategy` | Local only: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
-| `generate_token_automation` | History: nightly token + pipeline (merged into v3+) |
+| Branch | Tag | What it is |
+|---|---|---|
+| `main` | `v1.0` | Original strategy (GREEN→RED→RED at candle 3's close), older code. GitHub's default branch |
+| `archive/v2-early-sell` | `v2.0` | History: SELL parked at candle-2 HA Low − 1, fills in candle 3 |
+| `archive/token-automation` | — | History: nightly token + pipeline (merged into v3+) |
+| `archive/v3-offsets-1510` | `v3.0` | History: offsets −0.5 / +0.5, waiting order, lock 5/3, 15:10 square-off |
+| `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
+| `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day. **Latest without AI** |
+| **`aiagent-version-6`** | `v6.0`, `v6.1` | **Current.** version-5 + the AI options strategist (`algopilot/agent`): 1/3 analysis, pre-close check, can block the sell at 2/3 |
+| `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
+
+Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
+`generate_token_automation`, `old-strategy`); only the names changed, not the commits.
+Tags mark each version: `git checkout v5.0` returns to it exactly.
 
 Work only on the branch the owner names; create new versions as new branches
 from the one they name. Don't merge between strategy branches unasked.
