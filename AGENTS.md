@@ -39,7 +39,7 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
 | `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
 | `aiagent-version-6` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 |
-| **`version-7`** | `v7.0` | **Current.** Pure algorithm: `aiagent-version-6` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Same strategy as version-5, plus the startup funds warning and `.gitattributes` |
+| **`version-7`** | `v7.0` | **Current.** Pure algorithm: `aiagent-version-6` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **5/2** (was 18/2), plus the startup funds warning and `.gitattributes` |
 | `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 
 Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
@@ -68,8 +68,9 @@ from the one they name. Don't merge between strategy branches unasked.
 - **Stop**: HA High + 0.5 — candle 2's while candles 3–4 form, then the HA High
   2 candles back, moved every close. Live it rests at the exchange as a BUY
   stop-limit (limit +10%); not filled 3 s after crossing → market buy.
-- **Profit lock 18/2**: first lock at 18 points, then every 2, one step behind
-  (sold 100: 82→82, 80→82, 78→80, 76→78). Parked at the exchange when tighter.
+- **Profit lock** — version-5: **18/2** (sold 100: 82→82, 80→82, 78→80, 76→78);
+  version-7: **5/2** (sold 100: 95→95, 93→95, 91→93, 89→91). First lock at START
+  points, then every STEP, one step behind. Parked at the exchange when tighter.
 - **Limits**: max 6 trades/day (CE+PE), 1 lot live, daily loss limit
   (`OPTIONS_MAX_DAILY_LOSS`), same side needs a fresh GREEN after its exit,
   entries from 09:15, square-off at **15:10**, engine auto-stops 15:31.

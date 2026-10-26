@@ -11,7 +11,7 @@ Real-time pipeline:
         -> every tick on an open leg: Heikin-Ashi trailing stop, EOD square-off
 
 Entries are PURE pattern — no RSI gate, no volume gate. Three things close a
-position: the Heikin-Ashi trailing stop, the profit lock (18 points below the
+position: the Heikin-Ashi trailing stop, the profit lock (5 points below the
 entry, then every 2 points, one step behind the best — see _track_profit), and the
 EOD square-off (OPTIONS_SQUAREOFF_AT, 15:10). Whichever is reached first.
 At most OPTIONS_MAX_TRADES_PER_DAY trades a day (6), CE and PE together.

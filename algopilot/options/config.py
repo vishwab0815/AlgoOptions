@@ -168,7 +168,7 @@ class OptionsConfig:
     # one mark behind the best. Sold at 100: touch 82 -> lock 82; 80 -> still
     # 82; 78 -> 80; 76 -> 78. Buy back when the price comes back to the lock.
     profit_lock: bool = True
-    profit_lock_start_pts: float = 18.0
+    profit_lock_start_pts: float = 5.0
     profit_lock_step_pts: float = 2.0
 
     # Strikes. "premium": CE and PE each trade the strike whose premium is
@@ -354,7 +354,7 @@ def load_options_config() -> OptionsConfig:
         entry_limit_buffer_pct=max(0.0, float(os.getenv("OPTIONS_ENTRY_LIMIT_BUFFER_PCT", "3"))),
         max_trades_per_day=max(0, int(os.getenv("OPTIONS_MAX_TRADES_PER_DAY", "6"))),
         profit_lock=os.getenv("OPTIONS_PROFIT_LOCK", "true").strip().lower() == "true",
-        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "18"),
+        profit_lock_start_pts=_positive(os.getenv("OPTIONS_PROFIT_LOCK_START_POINTS", "5"),
                                         "OPTIONS_PROFIT_LOCK_START_POINTS"),
         profit_lock_step_pts=max(0.0, float(os.getenv("OPTIONS_PROFIT_LOCK_STEP_POINTS", "2"))),
         strike_pick=_strike_pick(os.getenv("OPTIONS_STRIKE_PICK", "premium")),
