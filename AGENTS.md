@@ -39,7 +39,7 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
 | `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day. **Latest without AI** |
 | `version-6-ai` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 (this branch) |
-| `version-7` | `v7.0`, `v7.1` | Pure algorithm: this branch with the AI removed; profit lock 5/2, strikes by premium above ₹300 |
+| `final-dhan` | `v7.0`–`v7.2` | **The final Dhan version (LIVE).** Was `version-7`. Pure algorithm: this branch with the AI removed; profit lock 50/2, strikes by premium above ₹300 |
 | `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 
 Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
