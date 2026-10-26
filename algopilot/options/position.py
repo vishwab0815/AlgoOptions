@@ -74,12 +74,12 @@ def profit_lock_level(entry_price: float, best_price: float, start_pts: float, s
 
     Marks are start, start+step, start+2*step ... points below the entry.
     Touching the first mark locks it; after that the lock stays ONE STEP
-    behind the best mark touched. Sold at 100 with 5/2:
-        touches 95 (5 pts)  -> buy back if it comes back to 95
-        touches 93 (7 pts)  -> still 95
-        touches 91 (9 pts)  -> 93
-        touches 89 (11 pts) -> 91
-        touches 87 (13 pts) -> 89        ... and so on, every 2 points."""
+    behind the best mark touched. Sold at 400 with 50/2:
+        touches 350 (50 pts) -> buy back if it comes back to 350
+        touches 348 (52 pts) -> still 350
+        touches 346 (54 pts) -> 348
+        touches 344 (56 pts) -> 346
+        touches 342 (58 pts) -> 344      ... and so on, every 2 points."""
     gained = entry_price - best_price
     if best_price <= 0 or gained + 1e-9 < start_pts:
         return None
