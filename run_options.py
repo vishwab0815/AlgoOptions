@@ -232,7 +232,8 @@ def _print_banner(config) -> None:
          f"{config.profit_lock_step_pts:g} pts (one step behind); buy back when it comes back"
          if config.profit_lock else f"│  {'profit lock':<18} off"),
         (f"│  {'AI strategist':<18} {config.ai_model} (effort {config.ai_effort}) checks every pattern: the sell "
-         f"goes in only at >= {config.ai_min_confidence}% confidence; news {config.ai_news_model}; "
+         f"goes in only at >= {config.ai_min_confidence}% confidence; pre-close check "
+         f"{f'{config.ai_preclose_secs} s before candle 2 closes' if config.ai_preclose_secs else 'off'}; news {config.ai_news_model}; "
          f"budget ${config.ai_daily_budget_usd:g}/day" if config.ai_agent else f"│  {'AI strategist':<18} off"),
         f"│  {'candle close':<18} exactly at the boundary"
         + (f" + {config.candle_close_grace_ms} ms grace" if config.candle_close_grace_ms else " (hh:mm:00.000), exchange trade time"),

@@ -74,8 +74,12 @@ with validation.
 
 ## 3b. The AI strategist (`aiagent-version-6`, `OPTIONS_AI_AGENT=true`)
 
-- **1/3 (GREEN candle):** `TradeAgent.prepare()` builds a market snapshot in code (`agent/features.py`) and asks Claude Opus 5.5 in the background for SELL/SKIP, a 0–100 confidence and reasons, as structured JSON.
-- **2/3 (sell order due):** `TradeAgent.decide()` reuses a fresh 1/3 answer, or re-checks within `OPTIONS_AI_DECIDE_TIMEOUT_SECS`. The order goes in only for SELL with confidence ≥ `OPTIONS_AI_MIN_CONFIDENCE`. The gate is in `engine._arm`, plus `_arm_best` when both sides are ready.
+- **1/3 (GREEN candle):** `TradeAgent.prepare()` builds a market snapshot in code (`agent/features.py`) and asks Claude Opus 5.5 in the background for SELL/SKIP, a 0–100 confidence (its probability the sell makes money) and evidence, as structured JSON.
+- **Pre-close (`engine._ai_preclose_clock`, `OPTIONS_AI_PRECLOSE_SECS`=60):** a candle 2 forming RED (provisional HA from `candle_builder._current`) gets a second analysis, stage `2/3-pre`, ready by the close.
+- **2/3 (sell order due):** `TradeAgent.decide()` uses the pre-close answer if NIFTY moved ≤ 15 pts and the final HA Low is within 3% of the provisional one; else a fresh 1/3 answer; else a re-check within `OPTIONS_AI_DECIDE_TIMEOUT_SECS`. The order goes in only for SELL with confidence ≥ `OPTIONS_AI_MIN_CONFIDENCE`. The gate is in `engine._arm`, plus `_arm_best` when both sides are ready.
+- **Snapshot extras:** `market_direction` (features.direction_section: VWAP, opening range, previous day, futures OI, fresh writing near ATM, PCR, VIX, BANK NIFTY, 8 heavyweights, futures volume - each votes up/down, score >= 3 = trend), the minute tape, our option's 1-min flow (premium/volume/OI), futures and VIX 1-min, market depth (`/marketfeed/quote`, live only), the 30-min straddle/IV trend, today's trades per side, and `similar_past_setups` from `agent/cases.py` (kNN over 10 numbers, only days before today).
+- **Memory:** `algopilot/agent/cases_seed.jsonl` (shipped) + `data/agent_cases.jsonl` (VM). `scripts/agent_cases.py [day | from to]` replays days through the engine (paper, temp ledger, stub AI) and saves every sell; the pipeline runs it after each session when the AI is on. Old weeks come from `/charts/rollingoption`.
+- **Rulebook (`prompts.py`):** the GREEN→RED pattern bets that the NIFTY push which pumped the option fades. The AI judges whether that push is tiring (SELL: against the day trend, at a wall or the day high/low, short covering, stretched from VWAP) or strong (SKIP: with the day trend on fresh positions, breaking the day high/low). `features.push_section` gives it those numbers. Default bar: 35 (a winner pays more than a typical loss), 50 for a weak setup (`OPTIONS_AI_WEAK_SETUP_CONFIDENCE`): `cases.setup_stats` splits the last 20 days of real sells by this pattern's buckets (our OI flow, stop %, time of day, push given back, VIX, trend); a bucket with >= 10 sells and <= 25% won is weak. Which buckets are weak shifts week to week (the 30-Sep→14-Oct and 07→21-Oct samples disagreed), so nothing is hard-coded: the numbers are recomputed from the memory on every call. News brief is off by default (web search kept failing). A pre-close SKIP is re-checked only on a real turn (15 pts / 8%). Log lines are pointwise: `+` for, `-` against, `=` the record.
 - **The agent may only block a sell.** It never places, moves or closes orders.
 - **Any failure follows the pattern** (fail-open): timeout, API error, budget used up.
 - **Never add an extra option-chain request.** The engine hands its polls to the agent (`dhan_client.last_chain_payload`).
@@ -98,7 +102,8 @@ with validation.
 | `algopilot/options/auto_token.py` | Token from PIN + TOTP |
 | `algopilot/core/` | Candle builder, Heikin-Ashi |
 | `algopilot/strategy/` | GREEN→RED→RED state machine (`signal_engine.py`) |
-| `algopilot/agent/` | AI strategist: `data.py` (Dhan data + chain hand-over), `features.py` (Market Reader), `prompts.py` (rulebook + JSON schema), `llm.py` (Claude calls, cost, budget), `agent.py` (1/3 / 2/3 orchestration) |
+| `algopilot/agent/` | AI strategist: `data.py` (Dhan data, depth, chain hand-over), `features.py` (Market Reader), `cases.py` (memory of past sells), `prompts.py` (rulebook + JSON schema), `llm.py` (Claude calls, cost, budget), `agent.py` (1/3 / pre-close / 2/3 orchestration) |
+| `scripts/agent_cases.py` | Grows the AI's memory: replays a day (AI off) and saves every sell with its numbers |
 | `algopilot/utils/market_hours.py`, `market_calendar.py` | Session times, square-off time, NSE holidays |
 | `scripts/daily_pipeline.py` | Run-forever automation on the VM (token 21:00, session 08:45) |
 | `scripts/backtest.py` | Replays real Dhan days through the engine (opening spot band only) |

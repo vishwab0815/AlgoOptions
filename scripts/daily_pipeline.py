@@ -17,6 +17,7 @@ Running forever:
       09:17-09:25: did NIFTY trade? if not (a closure missing from the holiday list), stop the engine
       engine crashed before the close? restart it (max 5; never with data/KILL); open positions resume
       the engine stops by itself after the close (15:31)
+      AI strategist on? -> today's sells are added to its memory (scripts/agent_cases.py)
   * weekends / NSE holidays (algopilot/utils/market_calendar.py) — nothing.
 
 Logged to data/pipeline.log (and the console). Only one copy can run at a time.
@@ -187,10 +188,25 @@ def run_day(popen=subprocess.Popen, now=now_ist, sleep=time.sleep, opened=market
             return 2
 
 
+def learn_today(run=subprocess.run) -> None:
+    """OPTIONS_AI_AGENT=true: add today's sells to the strategist's memory (data/agent_cases.jsonl).
+    A failure is only logged; it never affects trading."""
+    if (dotenv_values(ROOT / ".env").get("OPTIONS_AI_AGENT") or "").strip().lower() != "true":
+        return
+    log.info("AI memory: adding today's sells (scripts/agent_cases.py) ...")
+    try:
+        r = run([sys.executable, "scripts/agent_cases.py"], cwd=str(ROOT), env=_engine_env(), capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=3600)
+        lines = [x for x in (r.stdout or "").splitlines() if x.strip()]
+        log.info("AI memory: %s", " | ".join(lines[-2:]) or f"exit {r.returncode}")
+    except Exception as exc:
+        log.warning("AI memory update failed: %s", exc)
+
+
 # ── forever ─────────────────────────────────────────────────────────────────
 
 def run_forever(now=now_ist, sleep=time.sleep, day=run_day, token=ensure_fresh_token, clock=time.monotonic,
-                max_loops=None) -> int:
+                max_loops=None, learn=learn_today) -> int:
     """Nightly token at 21:00, a session every trading day from 08:45."""
     token_done = session_done = None             # the date each was last done
     retry_token_at = 0.0
@@ -211,6 +227,7 @@ def run_forever(now=now_ist, sleep=time.sleep, day=run_day, token=ensure_fresh_t
             session_done = t.date()
             log.info("──── %s ────", t.strftime("%A %d-%b-%Y"))
             day()
+            learn()
             log.info("Session over. Next: token at %s, next session from %s on the next trading day.",
                      NIGHT_TOKEN_AT.strftime("%H:%M"), SESSION_FROM.strftime("%H:%M"))
         sleep(LOOP_SECS)

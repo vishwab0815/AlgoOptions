@@ -108,7 +108,7 @@ class ClaudeClient:
         kwargs = dict(
             model=self.model, max_tokens=16000,
             system=[{"type": "text", "text": STRATEGIST_SYSTEM, "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": strategist_user(json.dumps(snapshot, separators=(",", ":")), stage, news)}],
+            messages=[{"role": "user", "content": strategist_user(json.dumps(snapshot, separators=(",", ":"), default=str), stage, news)}],
             output_config={"effort": effort, "format": {"type": "json_schema", "schema": DECISION_SCHEMA}},
         )
         t0 = asyncio.get_running_loop().time()

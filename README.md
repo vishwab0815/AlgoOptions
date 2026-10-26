@@ -67,15 +67,25 @@ Every pattern is checked by an AI options strategist before the sell order goes 
 | Moment | What happens |
 |---|---|
 | **1/3** — a GREEN candle on CE or PE | The market is read (below) and **Claude Opus 5.5** judges, in the background, whether selling that side would work if candle 2 turns RED |
-| **2/3** — candle 2 RED, order due | The 1/3 answer is used if it is fresh and NIFTY moved < 20 pts since; otherwise a quick re-check (max 25 s). The order goes in **only if it says SELL with ≥ 60% confidence** |
+| **Pre-close** — 60 s before candle 2 closes, while it is forming RED | A second, fresh analysis on the minute-by-minute picture and the real candle 2, so the answer is ready when the order is due (`OPTIONS_AI_PRECLOSE_SECS`) |
+| **2/3** — candle 2 RED, order due | The pre-close answer is used if NIFTY and candle 2 didn't change much in the last minute; otherwise the 1/3 answer if fresh, or a quick re-check (max 25 s). The order goes in **only if it says SELL with ≥ 35% confidence** (its probability that the sell makes money; a winner pays about ₹1,100, more than a typical loss), **or ≥ 50% for a weak setup** — one whose bucket (writers covering in our strike, stop > 14% of price, before 10:30 …) won ≤ 25% of this system's real sells in the last 20 days |
 
-**The logic it applies:**
-- NIFTY falling → calls fall → selling **CE** is favoured.
-- NIFTY rising → selling **PE** is favoured.
-- Sideways → the pattern often hits the stop, so it needs strong extra evidence.
+**The logic it applies:** candle 1 GREEN means a NIFTY push pumped the option (NIFTY up pumps a CE,
+NIFTY down pumps a PE), and candle 2 RED means the push paused. The question is: **is the push tiring or strong?**
+- **Sell** when it is tiring: the push runs against the day's trend, it hit a wall or the day high/low, it is short covering, it has already given back part of the move, or it is stretched from VWAP.
+- **Skip** when it is strong: the push runs with the day's trend on fresh positions, it broke the day high/low or a wall, or VIX is jumping.
+- **Sideways** days: sell at the edge of the box, skip in the middle.
 
 **What it reads** (the numbers are computed in code and passed to the AI):
+- **Its memory of similar past sells** (`algopilot/agent/cases.py`): every version-5 sell of the past days with the numbers seen at that moment and how it ended. For a new pattern the 10 most similar are shown: "4 of 10 won, average −₹210". Shipped with a month of real days (`cases_seed.jsonl`); the pipeline adds each day's sells after the session (`scripts/agent_cases.py`).
+- **Today so far:** today's trades on each side and their results.
+- **Market direction scorecard:** price vs VWAP, opening-range break, previous day's high/low, futures OI build-up, fresh option writing near ATM, PCR, VIX, BANK NIFTY, the 8 NIFTY heavyweights (live) and futures volume each vote up or down; 3 or more net votes = a trend day, otherwise a range day.
+- **The minute tape:** the last 20 one-minute bars of NIFTY, the future (with OI added each minute), India VIX and our option (premium, volume, OI added).
+- **Our option's flow:** premium vs its day VWAP; premium and OI change over 5/15/30 min (writers adding or covering); volume surge.
+- **Market depth** (live only): 5 levels of bids/offers and total buy vs sell quantity for our option and the future.
+- **Chain trend:** how the ATM straddle (the expected move) and our option's IV moved in the last 30 min.
 - NIFTY 5-min and 1-min candles: trend, slope, box size.
+- The push: its size, how much is given back, with or against the day trend, distance to the day high/low.
 - NIFTY futures VWAP and open interest: long or short build-up, short covering.
 - The option chain: walls, fresh open interest in the last 30 min, max pain, expected move, our option's Greeks.
 - India VIX and BANK NIFTY.
@@ -92,10 +102,10 @@ Every pattern is checked by an AI options strategist before the sell order goes 
 
 | Call | Cost |
 |---|---|
-| Strategist call (Opus 5.5) | about $0.027 and 16 s |
+| Strategist call (Opus 5.5) | about $0.03–0.05 and 15–30 s |
 | News brief (Sonnet 5.5, 3 web searches) | about $0.075 |
 
-A normal day comes to about **$1–2**, capped by the daily budget.
+A normal day comes to about **$2–4** (1/3 + pre-close analyses), capped by the daily budget.
 
 ## Live mode
 
