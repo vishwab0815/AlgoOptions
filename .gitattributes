@@ -1,0 +1,34 @@
+# Line endings. The repository stores LF; checkouts get the endings below, so the
+# Windows PC and the Windows VM always see the same files (no LF/CRLF noise in diffs).
+* text=auto
+
+# Windows text files: CRLF on disk
+*.py            text eol=crlf
+*.md            text eol=crlf
+*.txt           text eol=crlf
+*.example       text eol=crlf
+*.cfg           text eol=crlf
+*.ini           text eol=crlf
+*.toml          text eol=crlf
+*.yml           text eol=crlf
+*.yaml          text eol=crlf
+*.cmd           text eol=crlf
+*.bat           text eol=crlf
+*.ps1           text eol=crlf
+.gitignore      text eol=crlf
+.gitattributes  text eol=crlf
+
+# Data and shell files: LF everywhere
+*.json          text eol=lf
+*.jsonl         text eol=lf
+*.csv           text eol=lf
+*.sh            text eol=lf
+
+# Binary: never converted or diffed
+*.db            binary
+*.sqlite        binary
+*.zip           binary
+*.pdf           binary
+*.png           binary
+*.jpg           binary
+*.pkl           binary
