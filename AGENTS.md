@@ -38,11 +38,12 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `archive/v3-offsets-1510` | `v3.0` | History: offsets −0.5 / +0.5, waiting order, lock 5/3, 15:10 square-off |
 | `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
 | `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day. **Latest without AI** |
-| **`aiagent-version-6`** | `v6.0`, `v6.1` | **Current.** version-5 + the AI options strategist (`algopilot/agent`): 1/3 analysis, pre-close check, can block the sell at 2/3 |
+| `version-6-ai` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 (this branch) |
+| `version-7` | `v7.0`, `v7.1` | Pure algorithm: this branch with the AI removed; profit lock 5/2, strikes by premium above ₹300 |
 | `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 
 Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
-`generate_token_automation`, `old-strategy`); only the names changed, not the commits.
+`generate_token_automation`, `old-strategy`, `aiagent-version-6`); only the names changed, not the commits.
 Tags mark each version: `git checkout v5.0` returns to it exactly.
 
 Work only on the branch the owner names; create new versions as new branches
@@ -77,7 +78,7 @@ Every setting lives in `.env`; `.env.example` lists all of them with comments,
 in the same order. When you add a setting, add it to both and to `config.py`
 with validation.
 
-## 3b. The AI strategist (`aiagent-version-6`, `OPTIONS_AI_AGENT=true`)
+## 3b. The AI strategist (`version-6-ai`, `OPTIONS_AI_AGENT=true`)
 
 - **1/3 (GREEN candle):** `TradeAgent.prepare()` builds a market snapshot in code (`agent/features.py`) and asks Claude Opus 5.5 in the background for SELL/SKIP, a 0–100 confidence (its probability the sell makes money) and evidence, as structured JSON.
 - **Pre-close (`engine._ai_preclose_clock`, `OPTIONS_AI_PRECLOSE_SECS`=60):** a candle 2 forming RED (provisional HA from `candle_builder._current`) gets a second analysis, stage `2/3-pre`, ready by the close.
