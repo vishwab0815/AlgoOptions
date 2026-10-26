@@ -38,12 +38,12 @@ premium; sell-to-open only; SQLite ledger. Read this before changing anything.
 | `archive/v3-offsets-1510` | `v3.0` | History: offsets −0.5 / +0.5, waiting order, lock 5/3, 15:10 square-off |
 | `archive/v4-premium-doji` | `v4.0` | History: strikes by premium (OTM), doji rule, fresh funds, faster orders, lock 8/3 |
 | `version-5` | `v5.0` | Version 4's strategy without the doji rule + strikes by premium ₹100–150 (any moneyness) + profit lock 18/2 + max 6 trades a day |
-| `aiagent-version-6` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 |
-| **`version-7`** | `v7.0` | **Current.** Pure algorithm: `aiagent-version-6` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **5/2** (was 18/2) and strikes by premium **above ₹300** (was ₹100–150), plus the startup funds warning and `.gitattributes` |
+| `version-6-ai` | `v6.0`, `v6.1` | version-5 + the AI options strategist (`algopilot/agent`, Claude): 1/3 analysis, pre-close check, can block the sell at 2/3 |
+| **`version-7`** | `v7.0`, `v7.1` | **Current.** Pure algorithm: `version-6-ai` with the whole AI integration removed (no `algopilot/agent`, no Claude, no `anthropic`). Version-5's strategy with the profit lock at **5/2** (was 18/2) and strikes by premium **above ₹300** (was ₹100–150), plus the startup funds warning and `.gitattributes` |
 | `experiment/old-strategy` | — | Side idea: GREEN→RED→RED at candle 3's close, no doji/offsets, 6 trades/day, lock off |
 
 Branches were renamed on 26-Oct-2026 (old names: `version-2`, `version-3`, `version-4`,
-`generate_token_automation`, `old-strategy`); only the names changed, not the commits.
+`generate_token_automation`, `old-strategy`, `aiagent-version-6`); only the names changed, not the commits.
 Tags mark each version: `git checkout v5.0` returns to it exactly.
 
 Work only on the branch the owner names; create new versions as new branches
